@@ -1,0 +1,10 @@
+[general]
+name=TA Arc & Viewshed Analysis
+qgisMinimumVersion=3.22
+description=Sequential SAR workflow for unique cell sites, master tower viewsheds, cascade arc polygons, and bounded raster multiplication.
+version=1.0.0
+author=SAR Operations
+email=
+
+[about]
+description=Modular TA arc and viewshed analysis plugin for Search and Rescue cell-sector workflows in Hong Kong Grid 1980.
