@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Step 0 dialog: map raw CSV columns to standardized ping-layer fields.
+Prepare Cell Site Data dialog: map CSV columns and build unique cell sites.
 """
 
 import os
@@ -44,20 +44,21 @@ from .csv_prep_engine import (
     load_csv_as_layer,
     read_csv_column_names,
 )
-from .logic_engine import LOG_TAG
+from .logic_engine import LAYER_UNIQUE_SITES, LOG_TAG
 
 
 class CsvPrepDialog(QDialog):
-    """Map arbitrary CSV / table columns before the main SAR workflow."""
+    """Import CSV, map columns, and build prepared ping + unique cell site layers."""
 
-    def __init__(self, iface, parent=None):
+    def __init__(self, iface, viewshed_engine=None, parent=None):
         super().__init__(parent)
         self.iface = iface
+        self.viewshed_engine = viewshed_engine
         self.engine = CsvPrepEngine()
         self._column_names = []
         self._csv_path = ""
 
-        self.setWindowTitle("Step 0 — Prepare CSV / Map Columns")
+        self.setWindowTitle("Prepare Cell Site Data")
         self.setMinimumWidth(560)
         self._build_ui()
 
@@ -108,7 +109,8 @@ class CsvPrepDialog(QDialog):
         mapping_layout.addWidget(
             QLabel(
                 "Choose which CSV columns match each required field. "
-                f"Output layer: <b>{PREPARED_LAYER_NAME}</b>"
+                f"Creates <b>{PREPARED_LAYER_NAME}</b> and <b>{LAYER_UNIQUE_SITES}</b> "
+                "saved next to the project file."
             )
         )
 
@@ -205,7 +207,7 @@ class CsvPrepDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
-        buttons.button(QDialogButtonBox.Ok).setText("Prepare Layer")
+        buttons.button(QDialogButtonBox.Ok).setText("Prepare Cell Site Data")
         buttons.accepted.connect(self._run_prepare)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -395,7 +397,7 @@ class CsvPrepDialog(QDialog):
                 if _is_none(building_field):
                     raise ValueError("Select a building name field.")
 
-            layer = self.engine.prepare_layer(
+            ping_layer = self.engine.prepare_layer(
                 source,
                 mapping,
                 use_azimuth_mode=self.radio_az_delta.isChecked(),
@@ -406,13 +408,39 @@ class CsvPrepDialog(QDialog):
                 azimuth_delta=self.spin_azimuth_delta.value(),
             )
 
-            self._log(f"Step 0 complete: {layer.featureCount()} features in {PREPARED_LAYER_NAME}.")
-            QMessageBox.information(
-                self,
-                "CSV Prepared",
-                f"Created '{PREPARED_LAYER_NAME}' with {layer.featureCount()} feature(s).\n\n"
-                "Run Step 1 in the main dialog when ready.",
+            sites_layer = None
+            if self.viewshed_engine is not None:
+                sites_layer = self.viewshed_engine.extract_unique_sites(
+                    ping_layer,
+                    dem_layer=self.dem_layer_combo.currentLayer(),
+                )
+
+            from .csv_prep_engine import _prepared_ping_output_path
+
+            ping_count = ping_layer.featureCount()
+            sites_count = sites_layer.featureCount() if sites_layer else 0
+            self._log(
+                f"Prepare Cell Site Data complete: {ping_count} ping(s), "
+                f"{sites_count} unique site(s)."
             )
+
+            if sites_layer is not None:
+                QMessageBox.information(
+                    self,
+                    "Prepare Cell Site Data Complete",
+                    f"Created '{PREPARED_LAYER_NAME}' ({ping_count} ping feature(s)) and "
+                    f"'{LAYER_UNIQUE_SITES}' ({sites_count} tower(s)).\n\n"
+                    f"Saved next to the project file:\n"
+                    f"  {_prepared_ping_output_path()}\n"
+                    f"  {self.viewshed_engine._unique_sites_output_path()}",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Prepare Cell Site Data Complete",
+                    f"Created '{PREPARED_LAYER_NAME}' with {ping_count} feature(s).\n\n"
+                    f"Saved to:\n{_prepared_ping_output_path()}",
+                )
             self.accept()
 
         except Exception as exc:

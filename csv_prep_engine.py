@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Step 0 logic: import raw CSV, map columns via user selections, optional building
+Step 1 logic: import raw CSV, map columns via user selections, optional building
 spatial join, and output a standardized ping point layer for the main workflow.
 """
 
@@ -48,6 +48,17 @@ from .logic_engine import (
 
 PREPARED_LAYER_NAME = "Prepared_Ping_Layer"
 DEFAULT_CRS = QgsCoordinateReferenceSystem("EPSG:4326")
+
+
+def _prepared_ping_output_path():
+    """GeoPackage next to the saved QGIS project file for Prepare Cell Site Data."""
+    project_dir = QgsProject.instance().absolutePath()
+    if not project_dir:
+        raise RuntimeError(
+            "Save the QGIS project before running Prepare Cell Site Data. "
+            f"'{PREPARED_LAYER_NAME}' is written next to the project file."
+        )
+    return os.path.join(project_dir, f"{PREPARED_LAYER_NAME}.gpkg")
 
 # Standard field names written to the prepared layer (match logic_engine lookups).
 OUT_TOWER = "Cell_Site"
@@ -760,7 +771,21 @@ class CsvPrepEngine:
         for old in existing:
             QgsProject.instance().removeMapLayer(old.id())
 
-        QgsProject.instance().addMapLayer(out_layer)
+        output_path = _prepared_ping_output_path()
+        processing.run(
+            "native:savefeatures",
+            {
+                "INPUT": out_layer,
+                "OUTPUT": output_path,
+                "LAYER_NAME": PREPARED_LAYER_NAME,
+            },
+        )
+        saved_layer = QgsVectorLayer(output_path, PREPARED_LAYER_NAME, "ogr")
+        if not saved_layer.isValid():
+            raise RuntimeError(f"Failed to load saved prepared ping layer: {output_path}")
+
+        QgsProject.instance().addMapLayer(saved_layer)
+        self.log(f"Saved prepared ping layer to: {output_path}")
         unique_locations = len(coord_key_to_point)
         unique_sites = len({f[OUT_TOWER] for f in out_features})
         unmatched_locations = sum(
@@ -787,7 +812,7 @@ class CsvPrepEngine:
                 f"'{UNLOCATED_PREFIX}_…' Cell_Site IDs. Check that ping coordinates fall on building footprints.",
                 Qgis.Warning,
             )
-        return out_layer
+        return saved_layer
 
     def _resolve_cell_sites_by_location(
         self,

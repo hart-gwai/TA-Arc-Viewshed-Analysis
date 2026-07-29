@@ -50,7 +50,9 @@ FIELD_TIMESTAMP = ("Timestamp", "Event_Time", "DateTime", "Time", "Ping_Time", "
 FIELD_OBSERVER_H = ("observer_height", "Observer_Height", "obs_height", "height")
 
 LAYER_UNIQUE_SITES = "Unique_Cell_Sites"
-LAYER_CASCADE = "TA polygons overlaped"
+LAYER_TA_POLYGONS = "TA polygons"
+LAYER_CASCADE = "TA polygon overlapped"
+LEGACY_LAYER_CASCADE = "TA polygons overlaped"
 GROUP_MASTER_VIEWSHEDS = "Master Cell Site Viewshed"
 GROUP_TIMESTAMPED_VIEWSHEDS = "Timestamped Viewshed Layers"
 LEGACY_GROUP_MASTER_VIEWSHEDS = "Master Tower Viewsheds"
@@ -104,15 +106,74 @@ def _safe_group_name(value, fallback="unknown"):
     return (name[:80] if name else fallback)
 
 
-def _viewshed_layer_names(towers, pocket_id):
+def _viewshed_layer_names(display_towers, pocket_id):
     """Layer name: SITE or SITE1 x SITE2; file stem includes pocket id."""
-    ordered = sorted(towers)
+    ordered = sorted(display_towers, key=lambda name: name.upper())
     if len(ordered) == 1:
         layer_name = ordered[0]
     else:
         layer_name = " x ".join(ordered)
     file_stem = _safe_file_stem(f"{layer_name}_p{pocket_id}", f"pocket_{pocket_id}")
     return layer_name, file_stem
+
+
+RASTER_NODATA = -9999.0
+
+
+def _read_raster_band(path):
+    """Read band 1 from a GeoTIFF into a numpy array plus georeferencing."""
+    from osgeo import gdal
+
+    ds = gdal.Open(path, gdal.GA_ReadOnly)
+    if ds is None:
+        raise RuntimeError(f"Cannot open raster: {path}")
+    band = ds.GetRasterBand(1)
+    arr = band.ReadAsArray()
+    if arr is None:
+        raise RuntimeError(f"Cannot read raster band: {path}")
+    meta = {
+        "nodata": band.GetNoDataValue(),
+        "geotransform": ds.GetGeoTransform(),
+        "projection": ds.GetProjection(),
+    }
+    ds = None
+    return arr, meta
+
+
+def _write_float32_raster(path, arr, meta, nodata=RASTER_NODATA):
+    """Write a single-band Float32 GeoTIFF."""
+    from osgeo import gdal
+    import numpy as np
+
+    data = np.asarray(arr, dtype=np.float32)
+    driver = gdal.GetDriverByName("GTiff")
+    rows, cols = data.shape
+    out_ds = driver.Create(
+        path, cols, rows, 1, gdal.GDT_Float32, options=["COMPRESS=LZW"]
+    )
+    out_ds.SetGeoTransform(meta["geotransform"])
+    out_ds.SetProjection(meta["projection"])
+    out_band = out_ds.GetRasterBand(1)
+    out_band.SetNoDataValue(nodata)
+    out_band.WriteArray(data)
+    out_band.FlushCache()
+    out_ds = None
+
+
+def _array_to_binary(arr, nodata):
+    """Convert visibility values to Float32 0.0 (not visible) or 1.0 (visible)."""
+    import numpy as np
+
+    data = np.asarray(arr)
+    if data.size == 0:
+        raise RuntimeError("Raster array is empty.")
+    visible = data > 0
+    if nodata is not None:
+        try:
+            visible = visible & (data != nodata)
+        except (TypeError, ValueError):
+            pass
+    return np.where(visible, 1.0, 0.0).astype(np.float32)
 
 
 def _timestamp_subgroup_key(timestamp):
@@ -161,41 +222,64 @@ class TAArcViewshedEngine:
         layers = QgsProject.instance().mapLayersByName(name)
         return layers[0] if layers else None
 
-    def _master_viewshed_output_dir(self):
-        """Folder next to the saved QGIS project file for Step 2 rasters."""
+    def find_cascade_layer(self):
+        """Step 3 / Step 4 cascade pocket layer (current or legacy name)."""
+        for name in (LAYER_CASCADE, LEGACY_LAYER_CASCADE, "Cascade_Polygons"):
+            layer = self.find_layer_by_name(name)
+            if layer is not None:
+                return layer
+        return None
+
+    def _project_output_dir(self):
+        """Directory containing the saved QGIS project file."""
         project_dir = QgsProject.instance().absolutePath()
         if not project_dir:
             raise RuntimeError(
-                "Save the QGIS project before running Step 2. "
-                f"Viewshed rasters are written next to the project file in "
-                f"'{GROUP_MASTER_VIEWSHEDS}'."
+                "Save the QGIS project before running this step. "
+                "Outputs are written next to the project file."
             )
-        output_dir = os.path.join(project_dir, GROUP_MASTER_VIEWSHEDS)
+        return project_dir
+
+    def _unique_sites_output_path(self):
+        """GeoPackage next to the project file for Step 1 unique sites."""
+        return os.path.join(self._project_output_dir(), f"{LAYER_UNIQUE_SITES}.gpkg")
+
+    def _master_viewshed_output_dir(self):
+        """Folder next to the saved QGIS project file for Step 2 rasters."""
+        output_dir = os.path.join(self._project_output_dir(), GROUP_MASTER_VIEWSHEDS)
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
 
+    def _ta_polygons_output_path(self):
+        """GeoPackage for original arc sectors before cascade (Step 3)."""
+        return os.path.join(self._project_output_dir(), f"{LAYER_TA_POLYGONS}.gpkg")
+
     def _cascade_polygons_output_path(self):
-        """GeoPackage next to the saved QGIS project file for Step 3 polygons."""
-        project_dir = QgsProject.instance().absolutePath()
-        if not project_dir:
-            raise RuntimeError(
-                "Save the QGIS project before running Step 3. "
-                f"'{LAYER_CASCADE}' is written next to the project file."
-            )
-        return os.path.join(project_dir, f"{LAYER_CASCADE}.gpkg")
+        """GeoPackage next to the project file for Step 3 cascade pockets."""
+        return os.path.join(self._project_output_dir(), f"{LAYER_CASCADE}.gpkg")
 
     def _timestamped_viewshed_output_dir(self):
         """Folder next to the saved QGIS project file for Step 4 rasters."""
-        project_dir = QgsProject.instance().absolutePath()
-        if not project_dir:
-            raise RuntimeError(
-                "Save the QGIS project before running Step 4. "
-                f"Outputs are written next to the project file in "
-                f"'{GROUP_TIMESTAMPED_VIEWSHEDS}'."
-            )
-        output_dir = os.path.join(project_dir, GROUP_TIMESTAMPED_VIEWSHEDS)
+        output_dir = os.path.join(
+            self._project_output_dir(), GROUP_TIMESTAMPED_VIEWSHEDS
+        )
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
+
+    def _save_vector_to_gpkg(self, memory_layer, output_path, layer_name):
+        """Write a memory vector layer to GeoPackage and return the file layer."""
+        processing.run(
+            "native:savefeatures",
+            {
+                "INPUT": memory_layer,
+                "OUTPUT": output_path,
+                "LAYER_NAME": layer_name,
+            },
+        )
+        saved_layer = QgsVectorLayer(output_path, layer_name, "ogr")
+        if not saved_layer.isValid():
+            raise RuntimeError(f"Failed to load saved layer: {output_path}")
+        return saved_layer
 
     def _ensure_group(self, group_name):
         root = QgsProject.instance().layerTreeRoot()
@@ -438,7 +522,7 @@ class TAArcViewshedEngine:
     def _build_arc_from_ping(self, feat, field_map, site_lookup):
         tower = _tower_key(feat[field_map["tower"]])
         if tower not in site_lookup:
-            raise ValueError(f"Ping references unknown tower '{tower}'. Run Step 1 first.")
+            raise ValueError(f"Ping references unknown tower '{tower}'. Run Prepare Cell Site Data first.")
 
         site = site_lookup[tower]
         min_r = _safe_float(feat[field_map["min_r"]], site["min_radius"])
@@ -562,7 +646,11 @@ class TAArcViewshedEngine:
 
         provider.addFeatures(features)
         layer.updateExtents()
-        self._add_vector_to_project(layer)
+
+        output_path = self._unique_sites_output_path()
+        saved_layer = self._save_vector_to_gpkg(layer, output_path, LAYER_UNIQUE_SITES)
+        self._add_vector_to_project(saved_layer)
+        self.log(f"Saved unique sites to: {output_path}")
 
         if progress_callback:
             progress_callback(100)
@@ -571,7 +659,7 @@ class TAArcViewshedEngine:
             f"Unique sites: {len(features)} towers; "
             f"global min radius range computed per tower."
         )
-        return layer
+        return saved_layer
 
     # ----------------------------------------------------------- Step 2
     def generate_master_viewsheds(self, sites_layer, dem_layer, progress_callback=None, cancel_fn=None):
@@ -728,17 +816,26 @@ class TAArcViewshedEngine:
         if not arcs:
             raise ValueError("No arc geometries could be built from ping layer.")
 
+        if progress_callback:
+            progress_callback(40)
+
+        for name in (LAYER_TA_POLYGONS, LAYER_CASCADE, LEGACY_LAYER_CASCADE, "Cascade_Polygons"):
+            existing = self.find_layer_by_name(name)
+            if existing:
+                QgsProject.instance().removeMapLayer(existing.id())
+
+        original_layer = self._build_original_ta_polygons_layer(arcs)
+        original_path = self._ta_polygons_output_path()
+        saved_original = self._save_vector_to_gpkg(
+            original_layer, original_path, LAYER_TA_POLYGONS
+        )
+        self._add_layer_at_project_root(saved_original)
+        self.log(f"Saved original TA polygons to: {original_path}")
+
         pockets = self._apply_cascade_logic(arcs)
 
         if progress_callback:
             progress_callback(70)
-
-        existing = self.find_layer_by_name(LAYER_CASCADE)
-        if existing:
-            QgsProject.instance().removeMapLayer(existing.id())
-        legacy = self.find_layer_by_name("Cascade_Polygons")
-        if legacy:
-            QgsProject.instance().removeMapLayer(legacy.id())
 
         layer = QgsVectorLayer(
             f"Polygon?crs={CRS_HK1980.authid()}", LAYER_CASCADE, "memory"
@@ -775,23 +872,56 @@ class TAArcViewshedEngine:
         layer.updateExtents()
 
         output_path = self._cascade_polygons_output_path()
-        processing.run(
-            "native:savefeatures",
-            {"INPUT": layer, "OUTPUT": output_path, "LAYER_NAME": LAYER_CASCADE},
-        )
-
-        saved_layer = QgsVectorLayer(output_path, LAYER_CASCADE, "ogr")
-        if not saved_layer.isValid():
-            raise RuntimeError(f"Failed to load saved cascade polygons: {output_path}")
-
+        saved_layer = self._save_vector_to_gpkg(layer, output_path, LAYER_CASCADE)
         self._add_layer_at_project_root(saved_layer)
         self.log(f"Saved cascade polygons to: {output_path}")
 
         if progress_callback:
             progress_callback(100)
 
-        self.log(f"Cascade polygons: {len(out_features)} pockets created.")
+        self.log(
+            f"Cascade polygons: {len(out_features)} pocket(s); "
+            f"{len(arcs)} original arc polygon(s)."
+        )
         return saved_layer
+
+    def _build_original_ta_polygons_layer(self, arcs):
+        """One feature per ping arc before cascade intersection."""
+        layer = QgsVectorLayer(
+            f"Polygon?crs={CRS_HK1980.authid()}", LAYER_TA_POLYGONS, "memory"
+        )
+        provider = layer.dataProvider()
+        provider.addAttributes(
+            [
+                QgsField("Cell_Site", QVariant.String),
+                QgsField("Timestamp", QVariant.String),
+                QgsField("min_radius", QVariant.Double),
+                QgsField("max_radius", QVariant.Double),
+                QgsField("start_azimuth", QVariant.Double),
+                QgsField("end_azimuth", QVariant.Double),
+            ]
+        )
+        layer.updateFields()
+
+        features = []
+        for arc in arcs:
+            feat = QgsFeature(layer.fields())
+            feat.setGeometry(arc["geometry"])
+            feat.setAttributes(
+                [
+                    arc["tower"],
+                    arc.get("timestamp", ""),
+                    arc["min_r"],
+                    arc["max_r"],
+                    arc["start_az"],
+                    arc["end_az"],
+                ]
+            )
+            features.append(feat)
+
+        provider.addFeatures(features)
+        layer.updateExtents()
+        return layer
 
     def _apply_cascade_logic(self, arcs):
         """
@@ -946,104 +1076,37 @@ class TAArcViewshedEngine:
 
     def _normalize_to_binary(self, input_path, output_path):
         """Convert any viewshed raster to Float32 with values 0.0 or 1.0."""
-        calc_temp = f"{output_path}.calc.tif"
-        last_error = None
-        for formula in ("numpy.where(A>0,1,0)", "(A>0)"):
-            try:
-                self._gdal_raster_calc([input_path], formula, calc_temp)
-                last_error = None
-                break
-            except RuntimeError as exc:
-                last_error = exc
-        if last_error:
-            raise last_error
-
-        self._run_processing(
-            "gdal:translate",
-            {
-                "INPUT": calc_temp,
-                "NODATA": -9999,
-                "COPY_SUBDATASETS": False,
-                "OPTIONS": "COMPRESS=LZW",
-                "EXTRA": "-ot Float32 -scale 0 255 0 1",
-                "DATA_TYPE": 5,
-                "OUTPUT": output_path,
-            },
-        )
-        if os.path.isfile(calc_temp):
-            try:
-                os.remove(calc_temp)
-            except OSError:
-                pass
+        arr, meta = _read_raster_band(input_path)
+        binary = _array_to_binary(arr, meta["nodata"])
+        _write_float32_raster(output_path, binary, meta, nodata=RASTER_NODATA)
         if not os.path.isfile(output_path):
             raise RuntimeError(f"Binary normalization failed: {input_path}")
 
-    def _gdal_raster_calc(self, raster_paths, formula, output_path):
-        letters = "ABCDEF"
-        params = {
-            "FORMULA": formula,
-            "NO_DATA": -9999,
-            "RTYPE": 5,  # Float32
-            "OPTIONS": "",
-            "EXTRA": "",
-            "OUTPUT": output_path,
-        }
-        for letter in letters:
-            params[f"INPUT_{letter}"] = None
-            params[f"BAND_{letter}"] = None
-
-        if len(raster_paths) > len(letters):
-            raise RuntimeError(
-                f"Too many viewsheds ({len(raster_paths)}) for one GDAL calculation."
-            )
-
-        for i, path in enumerate(raster_paths):
-            letter = letters[i]
-            params[f"INPUT_{letter}"] = path
-            params[f"BAND_{letter}"] = 1
-
-        result = self._run_processing("gdal:rastercalculator", params)
-        out_path = result.get("OUTPUT", output_path) if isinstance(result, dict) else output_path
-        if not os.path.isfile(out_path):
-            raise RuntimeError(f"GDAL raster calculator failed: {formula}")
-
     def _combine_viewsheds(self, raster_paths, pocket_id, projwin, work_dir, output_path):
         """Intersect viewsheds within a pocket extent as Float32 0/1."""
-        clipped_inputs = []
+        binary_layers = []
+        meta = None
         for i, path in enumerate(raster_paths):
             clipped = os.path.join(work_dir, f"p{pocket_id}_src{i}.tif")
             self._clip_raster_to_extent(path, projwin, clipped)
-            clipped_inputs.append(clipped)
+            arr, clip_meta = _read_raster_band(clipped)
+            binary = _array_to_binary(arr, clip_meta["nodata"])
+            binary_layers.append(binary)
+            if meta is None:
+                meta = clip_meta
 
-        combined_temp = f"{output_path}.combined.tif"
-        if len(clipped_inputs) == 1:
-            self._gdal_raster_calc(clipped_inputs, "(A>0)", combined_temp)
-        elif len(clipped_inputs) <= 6:
-            letters = "ABCDEF"[: len(clipped_inputs)]
-            formula = "*".join(f"({letter}>0)" for letter in letters)
-            self._gdal_raster_calc(clipped_inputs, formula, combined_temp)
-        else:
-            current_path = os.path.join(work_dir, f"p{pocket_id}_acc1.tif")
-            self._gdal_raster_calc(
-                clipped_inputs[:2], "(A>0)*(B>0)", current_path
-            )
-            for i, next_path in enumerate(clipped_inputs[2:], start=2):
-                out_path = (
-                    combined_temp
-                    if i == len(clipped_inputs) - 1
-                    else os.path.join(work_dir, f"p{pocket_id}_acc{i}.tif")
-                )
-                self._gdal_raster_calc(
-                    [current_path, next_path], "(A>0)*(B>0)", out_path
-                )
-                current_path = out_path
+        if meta is None:
+            raise RuntimeError("No viewshed rasters were clipped for combination.")
 
-        self._normalize_to_binary(combined_temp, output_path)
-        if os.path.isfile(combined_temp):
-            try:
-                os.remove(combined_temp)
-            except OSError:
-                pass
+        combined = binary_layers[0].copy()
+        for layer_arr in binary_layers[1:]:
+            if layer_arr.shape != combined.shape:
+                raise RuntimeError(
+                    f"Pocket {pocket_id}: clipped viewshed dimensions do not match."
+                )
+            combined = combined * layer_arr
+
+        _write_float32_raster(output_path, combined, meta, nodata=RASTER_NODATA)
 
     def _clip_viewshed_to_mask(self, input_path, mask_layer, output_path):
         clipped_temp = f"{output_path}.clip.tif"
@@ -1097,7 +1160,10 @@ class TAArcViewshedEngine:
         self.timestamped_viewshed_output_dir = output_dir
         self._clear_layer_tree_group(GROUP_TIMESTAMPED_VIEWSHEDS)
         self._clear_legacy_cascade_groups()
-        self.log(f"Writing timestamped viewsheds to: {output_dir}")
+        self.log(
+            f"Writing timestamped viewsheds to: {output_dir} "
+            "(numpy binary pipeline v2)"
+        )
 
         features = list(cascade_layer.getFeatures())
         total = len(features) or 1
@@ -1113,9 +1179,10 @@ class TAArcViewshedEngine:
                 progress_callback(int(100 * idx / total))
 
             towers_raw = feat["Participating_Towers"] or ""
-            towers = [
-                _tower_key(t.strip()) for t in towers_raw.split("|") if t.strip()
+            display_towers = [
+                t.strip() for t in towers_raw.split("|") if t.strip()
             ]
+            towers = [_tower_key(t) for t in display_towers]
             if not towers:
                 continue
 
@@ -1145,7 +1212,7 @@ class TAArcViewshedEngine:
                 f"{bbox.xMinimum()},{bbox.xMaximum()},"
                 f"{bbox.yMinimum()},{bbox.yMaximum()}"
             )
-            layer_name, file_stem = _viewshed_layer_names(towers, pocket_id)
+            layer_name, file_stem = _viewshed_layer_names(display_towers, pocket_id)
             multiplied_path = os.path.join(work_dir, f"{file_stem}_multiplied.tif")
             clipped_path = os.path.join(ts_subdir, f"{file_stem}.tif")
 
