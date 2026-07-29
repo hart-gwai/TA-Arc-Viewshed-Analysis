@@ -10,6 +10,7 @@ from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 
 from .ui_dialog import TAArcViewshedDialog
+from .symbology_dialog import ViewshedSymbologyDialog
 
 
 class TAArcViewshedAnalysisPlugin:
@@ -23,6 +24,7 @@ class TAArcViewshedAnalysisPlugin:
         self.toolbar = self.iface.addToolBar("TA Arc Viewshed")
         self.toolbar.setObjectName("TAArcViewshedToolbar")
         self.dialog = None
+        self.symbology_dialog = None
 
     def tr(self, message):
         return self.iface.mapCanvas().tr(message) if hasattr(self.iface.mapCanvas(), "tr") else message
@@ -68,6 +70,15 @@ class TAArcViewshedAnalysisPlugin:
             status_tip=self.tr("Open TA Arc & Viewshed Analysis workflow"),
         )
 
+        self.add_action(
+            icon,
+            text=self.tr("Manage Viewshed Symbology"),
+            callback=self.run_symbology,
+            add_to_toolbar=False,
+            parent=self.iface.mainWindow(),
+            status_tip=self.tr("Apply viewshed raster symbology to layer groups"),
+        )
+
     def unload(self):
         for action in self.actions:
             self.iface.removePluginMenu(self.menu, action)
@@ -78,6 +89,10 @@ class TAArcViewshedAnalysisPlugin:
             self.dialog.close()
             self.dialog = None
 
+        if self.symbology_dialog is not None:
+            self.symbology_dialog.close()
+            self.symbology_dialog = None
+
     def run(self):
         if self.dialog is None:
             self.dialog = TAArcViewshedDialog(self.iface, self.iface.mainWindow())
@@ -86,3 +101,13 @@ class TAArcViewshedAnalysisPlugin:
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
+
+    def run_symbology(self):
+        if self.symbology_dialog is None:
+            self.symbology_dialog = ViewshedSymbologyDialog(
+                self.iface, self.iface.mainWindow()
+            )
+
+        self.symbology_dialog.show()
+        self.symbology_dialog.raise_()
+        self.symbology_dialog.activateWindow()
