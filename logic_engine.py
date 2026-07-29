@@ -53,11 +53,14 @@ LAYER_UNIQUE_SITES = "Unique_Cell_Sites"
 LAYER_TA_POLYGONS = "TA polygons"
 LAYER_CASCADE = "TA polygon overlapped"
 LEGACY_LAYER_CASCADE = "TA polygons overlaped"
-GROUP_MASTER_VIEWSHEDS = "Master Cell Site Viewshed"
+GROUP_MASTER_VIEWSHEDS = "Master Viewshed"
 GROUP_VIEWSHED_WITH_TA = "Viewshed with TA"
 GROUP_COMBINED_VIEWSHED = "Combined Viewshed"
 GROUP_TIMESTAMPED_VIEWSHEDS = "Timestamped Viewshed Layers"
-LEGACY_GROUP_MASTER_VIEWSHEDS = "Master Tower Viewsheds"
+LEGACY_MASTER_VIEWSHED_GROUPS = (
+    "Master Cell Site Viewshed",
+    "Master Tower Viewsheds",
+)
 VIEWSHED_LAYER_PREFIX = "Viewshed_"
 
 ARC_SEGMENTS = 48
@@ -216,6 +219,7 @@ class TAArcViewshedEngine:
         self.timestamped_viewshed_output_dir = ""
         self.last_viewshed_ta_count = 0
         self.last_viewshed_combined_count = 0
+        self.skipped_master_viewsheds = []
         self._transform_wgs84_to_hk = QgsCoordinateTransform(
             CRS_WGS84, CRS_HK1980, QgsProject.instance()
         )
@@ -253,6 +257,67 @@ class TAArcViewshedEngine:
     def _unique_sites_output_path(self):
         """GeoPackage next to the project file for Step 1 unique sites."""
         return os.path.join(self._project_output_dir(), f"{LAYER_UNIQUE_SITES}.gpkg")
+
+    def _remove_output_files(self, *paths):
+        """Delete prior Step 2 outputs so GDAL/OGR can recreate them."""
+        for path in paths:
+            if not path or not os.path.isfile(path):
+                continue
+            try:
+                os.remove(path)
+            except OSError as exc:
+                self.log(f"Could not remove stale file {path}: {exc}", Qgis.Warning)
+
+    def _observer_point_for_dem(self, geometry, source_crs, dem_layer):
+        """Return observer location and CRS authid matching the DEM."""
+        pt = geometry.asPoint()
+        dem_crs = dem_layer.crs()
+        if source_crs != dem_crs:
+            transform = QgsCoordinateTransform(
+                source_crs, dem_crs, QgsProject.instance()
+            )
+            pt = transform.transform(pt)
+        return pt, dem_crs.authid()
+
+    def _log_tower_dem_diagnostics(self, feat, dem_layer, tower, source_crs):
+        """Log tower vs DEM details to help diagnose viewshed failures."""
+        from .csv_prep_engine import _sample_dem_at_point
+
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            return
+
+        pt_source = geom.asPoint()
+        pt_dem, _ = self._observer_point_for_dem(geom, source_crs, dem_layer)
+        layer_extent = dem_layer.extent()
+        provider_extent = dem_layer.dataProvider().extent()
+        elev = _sample_dem_at_point(dem_layer, pt_source, source_crs)
+
+        self.log(
+            f"DEM check for '{tower}': layer='{dem_layer.name()}', "
+            f"crs={dem_layer.crs().authid()}, "
+            f"tower=({pt_source.x():.2f}, {pt_source.y():.2f}) {source_crs.authid()}, "
+            f"on_dem=({pt_dem.x():.2f}, {pt_dem.y():.2f}), "
+            f"sample_elev={elev}, "
+            f"layer_extent=({layer_extent.xMinimum():.0f}–{layer_extent.xMaximum():.0f}, "
+            f"{layer_extent.yMinimum():.0f}–{layer_extent.yMaximum():.0f}), "
+            f"provider_extent=({provider_extent.xMinimum():.0f}–{provider_extent.xMaximum():.0f}, "
+            f"{provider_extent.yMinimum():.0f}–{provider_extent.yMaximum():.0f})"
+        )
+
+    def _load_processing_layer(self, output, name="temp"):
+        """Load a processing OUTPUT value as a vector layer."""
+        if isinstance(output, QgsVectorLayer):
+            return output
+        if isinstance(output, str):
+            layer = QgsVectorLayer(output, name, "memory")
+            if layer.isValid():
+                return layer
+            layer = QgsVectorLayer(output, name, "ogr")
+            if layer.isValid():
+                return layer
+            raise RuntimeError(f"Failed to load processing output: {output}")
+        raise RuntimeError(f"Unexpected processing output type: {type(output)!r}")
 
     def _master_viewshed_output_dir(self):
         """Folder next to the saved QGIS project file for Step 2 rasters."""
@@ -499,14 +564,14 @@ class TAArcViewshedEngine:
         Build Cell_Site -> viewshed file path mapping from the current project.
 
         Uses in-memory paths from Step 2 when available, otherwise loads rasters
-        from the Master Cell Site Viewshed group or output folder on disk.
+        from the Master Viewshed group or output folder on disk.
         """
         if self.master_viewshed_paths:
             return self.master_viewshed_paths
 
         resolved = {}
         root = QgsProject.instance().layerTreeRoot()
-        for group_name in (GROUP_MASTER_VIEWSHEDS, LEGACY_GROUP_MASTER_VIEWSHEDS):
+        for group_name in (GROUP_MASTER_VIEWSHEDS,) + LEGACY_MASTER_VIEWSHED_GROUPS:
             group = root.findGroup(group_name)
             if group is None:
                 continue
@@ -524,27 +589,36 @@ class TAArcViewshedEngine:
 
         if not resolved:
             try:
-                output_dir = self._master_viewshed_output_dir()
+                project_dir = self._project_output_dir()
             except RuntimeError:
-                output_dir = ""
+                project_dir = ""
 
-            if output_dir and os.path.isdir(output_dir):
-                sites_layer = self.find_layer_by_name(LAYER_UNIQUE_SITES)
-                if sites_layer:
-                    tower_field = _first_matching_field(
-                        sites_layer.fields(), FIELD_TOWER
+            output_dirs = []
+            if project_dir:
+                for name in (GROUP_MASTER_VIEWSHEDS,) + LEGACY_MASTER_VIEWSHED_GROUPS:
+                    path = os.path.join(project_dir, name)
+                    if os.path.isdir(path):
+                        output_dirs.append(path)
+
+            sites_layer = self.find_layer_by_name(LAYER_UNIQUE_SITES)
+            for output_dir in output_dirs:
+                if not sites_layer:
+                    break
+                tower_field = _first_matching_field(
+                    sites_layer.fields(), FIELD_TOWER
+                )
+                if not tower_field:
+                    break
+                for idx, feat in enumerate(sites_layer.getFeatures()):
+                    tower = _tower_key(feat[tower_field])
+                    if not tower or tower in resolved:
+                        continue
+                    file_stem = _safe_file_stem(tower, f"site_{idx}")
+                    viewshed_path = os.path.join(
+                        output_dir, f"{file_stem}_viewshed.tif"
                     )
-                    if tower_field:
-                        for idx, feat in enumerate(sites_layer.getFeatures()):
-                            tower = _tower_key(feat[tower_field])
-                            if not tower:
-                                continue
-                            file_stem = _safe_file_stem(tower, f"site_{idx}")
-                            viewshed_path = os.path.join(
-                                output_dir, f"{file_stem}_viewshed.tif"
-                            )
-                            if os.path.isfile(viewshed_path):
-                                resolved[tower] = viewshed_path
+                    if os.path.isfile(viewshed_path):
+                        resolved[tower] = viewshed_path
 
         if resolved:
             self.master_viewshed_paths.update(resolved)
@@ -815,6 +889,7 @@ class TAArcViewshedEngine:
         RADIUS_IN = min_radius (inner dead-zone), RADIUS_OBS = max_radius.
         """
         self.master_viewshed_paths.clear()
+        self.skipped_master_viewsheds = []
         output_dir = self._master_viewshed_output_dir()
         self.master_viewshed_output_dir = output_dir
         self.log(f"Writing master viewsheds to: {output_dir}")
@@ -828,6 +903,7 @@ class TAArcViewshedEngine:
 
         features = list(sites_layer.getFeatures())
         total = len(features) or 1
+        sites_crs = sites_layer.crs()
         tower_field = _first_matching_field(sites_layer.fields(), FIELD_TOWER)
         if not tower_field:
             raise ValueError("Unique sites layer is missing a Cell_Site field.")
@@ -857,51 +933,87 @@ class TAArcViewshedEngine:
                         pass
 
             if max_radius <= 0:
-                raise ValueError(f"Tower '{tower}' has invalid max_radius {max_radius}.")
+                self.skipped_master_viewsheds.append(
+                    (tower, f"invalid max_radius {max_radius}")
+                )
+                self.log(
+                    f"Skipping tower '{tower}': invalid max_radius {max_radius}.",
+                    Qgis.Warning,
+                )
+                continue
             if min_radius >= max_radius:
                 min_radius = 0.0
 
-            vp_layer = QgsVectorLayer(
-                f"Point?crs={CRS_HK1980.authid()}", f"vp_{file_stem}", "memory"
+            viewshed_path = os.path.normpath(
+                os.path.join(output_dir, f"{file_stem}_viewshed.tif")
             )
-            vp_provider = vp_layer.dataProvider()
-            vp_provider.addAttributes([QgsField("radius_in", QVariant.Double)])
-            vp_layer.updateFields()
-            vp_feat = QgsFeature(vp_layer.fields())
-            vp_feat.setGeometry(feat.geometry())
-            vp_feat.setAttributes([min_radius])
-            vp_provider.addFeatures([vp_feat])
-            vp_layer.updateExtents()
+            self._remove_output_files(viewshed_path)
 
-            viewpoints_path = os.path.join(output_dir, f"{file_stem}_viewpoints.gpkg")
-            viewshed_path = os.path.join(output_dir, f"{file_stem}_viewshed.tif")
+            self._log_tower_dem_diagnostics(feat, dem_layer, tower, sites_crs)
+
+            obs_pt, obs_crs = self._observer_point_for_dem(
+                feat.geometry(), sites_crs, dem_layer
+            )
+            vp_input = None
+            last_error = None
+            radius_attempts = [min_radius]
+            if min_radius > 0:
+                radius_attempts.append(0.0)
+
+            for attempt_min_r in radius_attempts:
+                if attempt_min_r != min_radius:
+                    self.log(
+                        f"Retrying '{tower}' with RADIUS_IN=0 "
+                        f"(original inner radius {min_radius} m failed).",
+                        Qgis.Warning,
+                    )
+
+                attempt_layer = QgsVectorLayer(
+                    f"Point?crs={obs_crs}", f"vp_{file_stem}_{attempt_min_r}", "memory"
+                )
+                attempt_provider = attempt_layer.dataProvider()
+                attempt_provider.addAttributes([QgsField("radius_in", QVariant.Double)])
+                attempt_layer.updateFields()
+                attempt_feat = QgsFeature(attempt_layer.fields())
+                attempt_feat.setGeometry(QgsGeometry.fromPointXY(obs_pt))
+                attempt_feat.setAttributes([attempt_min_r])
+                attempt_provider.addFeatures([attempt_feat])
+                attempt_layer.updateExtents()
+
+                try:
+                    create_params = {
+                        "OBSERVER_POINTS": attempt_layer,
+                        "DEM": dem_layer,
+                        "RADIUS": max_radius,
+                        "OBS_HEIGHT": observer_height,
+                        "TARGET_HEIGHT": TARGET_HEIGHT,
+                        "OUTPUT": "memory:",
+                    }
+                    if attempt_min_r > 0:
+                        create_params["RADIUS_IN_FIELD"] = "radius_in"
+
+                    vp_result = processing.run(
+                        "visibility:createviewpoints",
+                        create_params,
+                    )
+
+                    candidate = self._load_processing_layer(
+                        vp_result.get("OUTPUT"), f"viewpoints_{file_stem}"
+                    )
+                    if candidate.featureCount() == 0:
+                        raise RuntimeError(
+                            "No viewpoints in the chosen area (outside DEM or nodata)."
+                        )
+                    vp_input = candidate
+                    break
+                except Exception as exc:
+                    last_error = exc
 
             try:
-                create_params = {
-                    "OBSERVER_POINTS": vp_layer,
-                    "DEM": dem_layer,
-                    "RADIUS": max_radius,
-                    "OBS_HEIGHT": observer_height,
-                    "TARGET_HEIGHT": TARGET_HEIGHT,
-                    "OUTPUT": viewpoints_path,
-                }
-                if min_radius > 0:
-                    create_params["RADIUS_IN_FIELD"] = "radius_in"
-
-                vp_result = processing.run(
-                    "visibility:createviewpoints",
-                    create_params,
-                )
-
-                vp_source = vp_result.get("OUTPUT", viewpoints_path)
-                if isinstance(vp_source, str):
-                    vp_input = QgsVectorLayer(vp_source, f"viewpoints_{file_stem}", "ogr")
-                    if not vp_input.isValid():
-                        vp_input = QgsVectorLayer(viewpoints_path, f"viewpoints_{file_stem}", "ogr")
-                    if not vp_input.isValid():
-                        raise RuntimeError(f"Failed to load viewpoints layer: {vp_source}")
-                else:
-                    vp_input = vp_source
+                if vp_input is None:
+                    raise last_error or RuntimeError(
+                        "Could not create viewpoints for this tower."
+                    )
 
                 processing.run(
                     "visibility:viewshed",
@@ -916,13 +1028,23 @@ class TAArcViewshedEngine:
                     },
                 )
             except Exception as exc:
-                raise RuntimeError(
-                    f"Viewshed failed for tower '{tower}' "
-                    f"(RADIUS_IN={min_radius}, RADIUS_OBS={max_radius}): {exc}"
-                ) from exc
+                self.skipped_master_viewsheds.append((tower, str(exc)))
+                self.log(
+                    f"Skipping tower '{tower}' "
+                    f"(RADIUS_IN={min_radius}, RADIUS_OBS={max_radius}): {exc}",
+                    Qgis.Warning,
+                )
+                continue
 
             if not os.path.isfile(viewshed_path):
-                raise RuntimeError(f"Viewshed output was not created for tower '{tower}'.")
+                self.skipped_master_viewsheds.append(
+                    (tower, "viewshed output file was not created")
+                )
+                self.log(
+                    f"Skipping tower '{tower}': viewshed output was not created.",
+                    Qgis.Warning,
+                )
+                continue
 
             self.master_viewshed_paths[tower] = viewshed_path
             self._add_raster_to_project(
@@ -936,6 +1058,24 @@ class TAArcViewshedEngine:
 
         if progress_callback:
             progress_callback(100)
+
+        if not self.master_viewshed_paths:
+            details = "; ".join(
+                f"{name} ({reason})" for name, reason in self.skipped_master_viewsheds[:5]
+            )
+            if len(self.skipped_master_viewsheds) > 5:
+                details += f"; …and {len(self.skipped_master_viewsheds) - 5} more"
+            raise RuntimeError(
+                "No master viewsheds were created. "
+                f"All {len(self.skipped_master_viewsheds)} tower(s) were skipped. {details}"
+            )
+
+        if self.skipped_master_viewsheds:
+            self.log(
+                f"Step 2 finished with {len(self.master_viewshed_paths)} viewshed(s); "
+                f"skipped {len(self.skipped_master_viewsheds)} tower(s).",
+                Qgis.Warning,
+            )
         return True
 
     # ----------------------------------------------------------- Step 3

@@ -268,12 +268,22 @@ class TAArcViewshedDialog(QDialog):
             if success and count > 0:
                 self._log(f"Step 2 complete: {count} master viewshed(s).")
                 folder = self.engine.master_viewshed_output_dir or GROUP_MASTER_VIEWSHEDS
+                skipped = getattr(self.engine, "skipped_master_viewsheds", [])
+                skip_note = ""
+                if skipped:
+                    skip_note = (
+                        f"\n\nSkipped {len(skipped)} tower(s) (outside DEM or failed):\n"
+                        + "\n".join(f"  • {name}" for name, _ in skipped[:8])
+                    )
+                    if len(skipped) > 8:
+                        skip_note += f"\n  …and {len(skipped) - 8} more (see QGIS log)"
                 QMessageBox.information(
                     self,
                     "Step 2 Complete",
                     f"Generated {count} master viewshed raster(s).\n\n"
                     f"Folder: {folder}\n"
-                    f"Layer group: {GROUP_MASTER_VIEWSHEDS}",
+                    f"Layer group: {GROUP_MASTER_VIEWSHEDS}"
+                    f"{skip_note}",
                 )
             else:
                 QMessageBox.critical(
