@@ -54,6 +54,8 @@ LAYER_TA_POLYGONS = "TA polygons"
 LAYER_CASCADE = "TA polygon overlapped"
 LEGACY_LAYER_CASCADE = "TA polygons overlaped"
 GROUP_MASTER_VIEWSHEDS = "Master Cell Site Viewshed"
+GROUP_VIEWSHED_WITH_TA = "Viewshed with TA"
+GROUP_COMBINED_VIEWSHED = "Combined Viewshed"
 GROUP_TIMESTAMPED_VIEWSHEDS = "Timestamped Viewshed Layers"
 LEGACY_GROUP_MASTER_VIEWSHEDS = "Master Tower Viewsheds"
 VIEWSHED_LAYER_PREFIX = "Viewshed_"
@@ -209,7 +211,11 @@ class TAArcViewshedEngine:
         self.iface = iface
         self.master_viewshed_paths = {}  # Cell_Site -> raster file path
         self.master_viewshed_output_dir = ""
+        self.viewshed_with_ta_output_dir = ""
+        self.combined_viewshed_output_dir = ""
         self.timestamped_viewshed_output_dir = ""
+        self.last_viewshed_ta_count = 0
+        self.last_viewshed_combined_count = 0
         self._transform_wgs84_to_hk = QgsCoordinateTransform(
             CRS_WGS84, CRS_HK1980, QgsProject.instance()
         )
@@ -221,6 +227,10 @@ class TAArcViewshedEngine:
     def find_layer_by_name(self, name):
         layers = QgsProject.instance().mapLayersByName(name)
         return layers[0] if layers else None
+
+    def find_ta_polygons_layer(self):
+        """Original TA arc polygon layer from Step 3."""
+        return self.find_layer_by_name(LAYER_TA_POLYGONS)
 
     def find_cascade_layer(self):
         """Step 3 / Step 4 cascade pocket layer (current or legacy name)."""
@@ -258,13 +268,23 @@ class TAArcViewshedEngine:
         """GeoPackage next to the project file for Step 3 cascade pockets."""
         return os.path.join(self._project_output_dir(), f"{LAYER_CASCADE}.gpkg")
 
-    def _timestamped_viewshed_output_dir(self):
-        """Folder next to the saved QGIS project file for Step 4 rasters."""
+    def _viewshed_with_ta_output_dir(self):
+        """Folder next to the project file for Step 4 TA polygon viewsheds."""
+        output_dir = os.path.join(self._project_output_dir(), GROUP_VIEWSHED_WITH_TA)
+        os.makedirs(output_dir, exist_ok=True)
+        return output_dir
+
+    def _combined_viewshed_output_dir(self):
+        """Folder next to the project file for Step 4 combined viewsheds."""
         output_dir = os.path.join(
-            self._project_output_dir(), GROUP_TIMESTAMPED_VIEWSHEDS
+            self._project_output_dir(), GROUP_COMBINED_VIEWSHED
         )
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
+
+    def _timestamped_viewshed_output_dir(self):
+        """Legacy alias for combined viewshed output folder."""
+        return self._combined_viewshed_output_dir()
 
     def _save_vector_to_gpkg(self, memory_layer, output_path, layer_name):
         """Write a memory vector layer to GeoPackage and return the file layer."""
@@ -317,8 +337,135 @@ class TAArcViewshedEngine:
         for child in list(root.children()):
             if not hasattr(child, "name"):
                 continue
-            if child.name().startswith("Cascade Viewsheds"):
+            name = child.name()
+            if name.startswith("Cascade Viewsheds") or name == GROUP_TIMESTAMPED_VIEWSHEDS:
                 root.removeChildNode(child)
+
+    def _towers_from_polygon_feature(self, feat, mode):
+        """Return display tower names and lookup keys from a polygon feature."""
+        if mode == "ta":
+            site = str(feat["Cell_Site"] or "").strip()
+            if not site:
+                return [], []
+            return [site], [_tower_key(site)]
+
+        towers_raw = feat["Participating_Towers"] or ""
+        display_towers = [t.strip() for t in towers_raw.split("|") if t.strip()]
+        return display_towers, [_tower_key(t) for t in display_towers]
+
+    def _feature_key(self, feat, mode, index):
+        """Stable numeric id for temp/output file naming."""
+        if mode == "cascade" and feat.fields().indexOf("pocket_id") >= 0:
+            return int(feat["pocket_id"])
+        if feat.id() >= 0:
+            return feat.id()
+        return index + 1
+
+    def _timestamp_from_polygon_feature(self, feat):
+        """Read timestamp attribute from TA or cascade polygon features."""
+        if feat.fields().indexOf("Timestamp") >= 0:
+            return feat["Timestamp"]
+        ts_field = _first_matching_field(feat.fields(), FIELD_TIMESTAMP)
+        if ts_field:
+            return feat[ts_field]
+        return ""
+
+    def _run_viewshed_analysis_pass(
+        self,
+        polygon_layer,
+        group_name,
+        output_dir,
+        mode,
+        work_subdir,
+        progress_callback=None,
+        cancel_fn=None,
+    ):
+        """
+        Multiply master viewsheds per polygon feature and clip to its geometry.
+
+        mode='ta' uses original TA polygons (single tower per feature).
+        mode='cascade' uses TA polygon overlapped pockets.
+        """
+        features = list(polygon_layer.getFeatures())
+        total = len(features) or 1
+        created_count = 0
+        work_dir = os.path.join(output_dir, work_subdir)
+        os.makedirs(work_dir, exist_ok=True)
+
+        for idx, feat in enumerate(features):
+            if cancel_fn and cancel_fn():
+                return created_count
+
+            if progress_callback:
+                progress_callback(int(100 * idx / total))
+
+            display_towers, towers = self._towers_from_polygon_feature(feat, mode)
+            if not towers:
+                continue
+
+            feature_key = self._feature_key(feat, mode, idx)
+            ts_key = _timestamp_subgroup_key(self._timestamp_from_polygon_feature(feat))
+
+            raster_paths = [
+                self.master_viewshed_paths[t]
+                for t in towers
+                if t in self.master_viewshed_paths
+            ]
+            missing = [t for t in towers if t not in self.master_viewshed_paths]
+            for tower in missing:
+                self.log(
+                    f"{group_name} feature {feature_key}: "
+                    f"missing master viewshed for {tower}",
+                    Qgis.Warning,
+                )
+            if not raster_paths:
+                continue
+
+            ts_subdir = os.path.join(output_dir, ts_key)
+            os.makedirs(ts_subdir, exist_ok=True)
+
+            bbox = feat.geometry().boundingBox()
+            bbox.grow(max(bbox.width(), bbox.height()) * 0.01 + 1.0)
+            projwin = (
+                f"{bbox.xMinimum()},{bbox.xMaximum()},"
+                f"{bbox.yMinimum()},{bbox.yMaximum()}"
+            )
+            layer_name, file_stem = _viewshed_layer_names(display_towers, feature_key)
+            multiplied_path = os.path.join(work_dir, f"{file_stem}_multiplied.tif")
+            clipped_path = os.path.join(ts_subdir, f"{file_stem}.tif")
+
+            try:
+                self._combine_viewsheds(
+                    raster_paths, feature_key, projwin, work_dir, multiplied_path
+                )
+                mask_layer = self._vector_mask_from_feature(feat, feature_key)
+                self._clip_viewshed_to_mask(
+                    multiplied_path, mask_layer, clipped_path
+                )
+
+                subgroup = self._ensure_subgroup(group_name, ts_key)
+                raster_layer = QgsRasterLayer(clipped_path, layer_name, "gdal")
+                if not raster_layer.isValid():
+                    raise RuntimeError(
+                        f"Failed to load clipped viewshed: {clipped_path}"
+                    )
+                QgsProject.instance().addMapLayer(raster_layer, False)
+                subgroup.addLayer(raster_layer)
+                created_count += 1
+                self.log(
+                    f"{layer_name}: saved to {clipped_path} and added under "
+                    f"{group_name}/{ts_key}"
+                )
+            except Exception as exc:
+                self.log(
+                    f"{group_name} feature {feature_key} failed: {exc}",
+                    Qgis.Warning,
+                )
+                self.log(traceback.format_exc(), Qgis.Warning)
+
+        if progress_callback:
+            progress_callback(100)
+        return created_count
 
     def _add_vector_to_project(self, layer, group_name=None):
         if group_name:
@@ -1143,12 +1290,23 @@ class TAArcViewshedEngine:
 
     # ----------------------------------------------------------- Step 4
     def multiply_and_crop_rasters(
-        self, cascade_layer, dem_layer, progress_callback=None, cancel_fn=None
+        self,
+        ta_polygons_layer,
+        cascade_layer,
+        dem_layer,
+        progress_callback=None,
+        cancel_fn=None,
     ):
         """
-        For each cascade pocket, multiply participating master viewsheds within
-        the feature bounding box, then clip to the curved polygon mask.
+        Run viewshed analysis twice:
+
+        1. Clip/combine master viewsheds to each original TA polygon →
+           group ``Viewshed with TA`` (timestamp subgroups).
+        2. Clip/combine master viewsheds to each overlapped cascade pocket →
+           group ``Combined Viewshed`` (timestamp subgroups).
         """
+        del dem_layer  # retained for API compatibility with the dialog
+
         self.resolve_master_viewshed_paths()
         if not self.master_viewshed_paths:
             raise RuntimeError(
@@ -1156,107 +1314,68 @@ class TAArcViewshedEngine:
                 f"from '{GROUP_MASTER_VIEWSHEDS}'."
             )
 
-        output_dir = self._timestamped_viewshed_output_dir()
-        self.timestamped_viewshed_output_dir = output_dir
-        self._clear_layer_tree_group(GROUP_TIMESTAMPED_VIEWSHEDS)
+        self.viewshed_with_ta_output_dir = self._viewshed_with_ta_output_dir()
+        self.combined_viewshed_output_dir = self._combined_viewshed_output_dir()
+        self.timestamped_viewshed_output_dir = self.combined_viewshed_output_dir
+
+        for group_name in (
+            GROUP_VIEWSHED_WITH_TA,
+            GROUP_COMBINED_VIEWSHED,
+            GROUP_TIMESTAMPED_VIEWSHEDS,
+        ):
+            self._clear_layer_tree_group(group_name)
         self._clear_legacy_cascade_groups()
+
         self.log(
-            f"Writing timestamped viewsheds to: {output_dir} "
-            "(numpy binary pipeline v2)"
+            f"Viewshed analysis: writing TA outputs to {self.viewshed_with_ta_output_dir} "
+            f"and combined outputs to {self.combined_viewshed_output_dir}"
         )
 
-        features = list(cascade_layer.getFeatures())
-        total = len(features) or 1
-        created_count = 0
-        work_dir = os.path.join(output_dir, "_work")
-        os.makedirs(work_dir, exist_ok=True)
+        def _scaled_progress(offset, scale):
+            def _emit(value):
+                if progress_callback:
+                    progress_callback(offset + int(value * scale / 100))
 
-        for idx, feat in enumerate(features):
-            if cancel_fn and cancel_fn():
-                return False
+            return _emit
 
-            if progress_callback:
-                progress_callback(int(100 * idx / total))
+        ta_count = self._run_viewshed_analysis_pass(
+            ta_polygons_layer,
+            GROUP_VIEWSHED_WITH_TA,
+            self.viewshed_with_ta_output_dir,
+            mode="ta",
+            work_subdir="_work_ta",
+            progress_callback=_scaled_progress(0, 50),
+            cancel_fn=cancel_fn,
+        )
+        if cancel_fn and cancel_fn():
+            return False
 
-            towers_raw = feat["Participating_Towers"] or ""
-            display_towers = [
-                t.strip() for t in towers_raw.split("|") if t.strip()
-            ]
-            towers = [_tower_key(t) for t in display_towers]
-            if not towers:
-                continue
-
-            pocket_id = feat["pocket_id"]
-            ts_key = _timestamp_subgroup_key(feat["Timestamp"])
-
-            raster_paths = [
-                self.master_viewshed_paths[t]
-                for t in towers
-                if t in self.master_viewshed_paths
-            ]
-            missing = [t for t in towers if t not in self.master_viewshed_paths]
-            for tower in missing:
-                self.log(
-                    f"Pocket {pocket_id}: missing master viewshed for {tower}",
-                    Qgis.Warning,
-                )
-            if not raster_paths:
-                continue
-
-            ts_subdir = os.path.join(output_dir, ts_key)
-            os.makedirs(ts_subdir, exist_ok=True)
-
-            bbox = feat.geometry().boundingBox()
-            bbox.grow(max(bbox.width(), bbox.height()) * 0.01 + 1.0)
-            projwin = (
-                f"{bbox.xMinimum()},{bbox.xMaximum()},"
-                f"{bbox.yMinimum()},{bbox.yMaximum()}"
-            )
-            layer_name, file_stem = _viewshed_layer_names(display_towers, pocket_id)
-            multiplied_path = os.path.join(work_dir, f"{file_stem}_multiplied.tif")
-            clipped_path = os.path.join(ts_subdir, f"{file_stem}.tif")
-
-            try:
-                self._combine_viewsheds(
-                    raster_paths, pocket_id, projwin, work_dir, multiplied_path
-                )
-                mask_layer = self._vector_mask_from_feature(feat, pocket_id)
-                self._clip_viewshed_to_mask(
-                    multiplied_path, mask_layer, clipped_path
-                )
-
-                subgroup = self._ensure_subgroup(
-                    GROUP_TIMESTAMPED_VIEWSHEDS, ts_key
-                )
-                raster_layer = QgsRasterLayer(clipped_path, layer_name, "gdal")
-                if not raster_layer.isValid():
-                    raise RuntimeError(
-                        f"Failed to load clipped viewshed: {clipped_path}"
-                    )
-                QgsProject.instance().addMapLayer(raster_layer, False)
-                subgroup.addLayer(raster_layer)
-                created_count += 1
-                self.log(
-                    f"{layer_name}: saved to {clipped_path} and added under "
-                    f"{GROUP_TIMESTAMPED_VIEWSHEDS}/{ts_key}"
-                )
-            except Exception as exc:
-                self.log(
-                    f"Pocket {pocket_id} failed: {exc}",
-                    Qgis.Warning,
-                )
-                self.log(traceback.format_exc(), Qgis.Warning)
+        combined_count = self._run_viewshed_analysis_pass(
+            cascade_layer,
+            GROUP_COMBINED_VIEWSHED,
+            self.combined_viewshed_output_dir,
+            mode="cascade",
+            work_subdir="_work_combined",
+            progress_callback=_scaled_progress(50, 50),
+            cancel_fn=cancel_fn,
+        )
 
         if progress_callback:
             progress_callback(100)
 
-        if created_count == 0:
+        if ta_count == 0 and combined_count == 0:
             raise RuntimeError(
-                "No timestamped viewshed layers were created. "
-                "Check the QGIS message log for per-pocket errors."
+                "No viewshed layers were created. "
+                "Check the QGIS message log for per-feature errors."
             )
 
-        self.log(f"Step 4 complete: {created_count} timestamped viewshed layer(s).")
+        self.last_viewshed_ta_count = ta_count
+        self.last_viewshed_combined_count = combined_count
+        self.log(
+            f"Viewshed analysis complete: {ta_count} layer(s) in "
+            f"'{GROUP_VIEWSHED_WITH_TA}', {combined_count} layer(s) in "
+            f"'{GROUP_COMBINED_VIEWSHED}'."
+        )
         return True
 
 
@@ -1301,8 +1420,9 @@ class ViewshedGenerationTask(QgsTask):
 class RasterMultiplyTask(QgsTask):
     """Background task wrapper for Step 4 raster multiply and clip."""
 
-    def __init__(self, description, cascade_layer, dem_layer, engine, progress_callback=None):
+    def __init__(self, description, cascade_layer, dem_layer, engine, progress_callback=None, ta_polygons_layer=None):
         super().__init__(description, QgsTask.CanCancel)
+        self.ta_polygons_layer = ta_polygons_layer
         self.cascade_layer = cascade_layer
         self.dem_layer = dem_layer
         self.engine = engine
@@ -1313,6 +1433,7 @@ class RasterMultiplyTask(QgsTask):
     def run(self):
         try:
             self.success = self.engine.multiply_and_crop_rasters(
+                self.ta_polygons_layer,
                 self.cascade_layer,
                 self.dem_layer,
                 progress_callback=self._emit_progress,
