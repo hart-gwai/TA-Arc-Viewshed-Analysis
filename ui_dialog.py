@@ -135,8 +135,9 @@ class TAArcViewshedDialog(QDialog):
         step3_layout = QVBoxLayout(step3_group)
         step3_layout.addWidget(
             QLabel(
-                "Build curved arc polygons (TA polygons), apply 3-tier cascade intersection "
-                f"logic, and save {LAYER_TA_POLYGONS} and {LAYER_CASCADE} next to the project file."
+                "Build curved arc polygons (TA polygons), apply cascade overlap logic "
+                "(Rule 1: all arcs when none overlap; Rule 2/3: overlap pockets only "
+                f"when they do), and save {LAYER_TA_POLYGONS} and {LAYER_CASCADE}."
             )
         )
         self.btn_step3 = QPushButton(STEP_TA_POLYGON)
@@ -150,8 +151,9 @@ class TAArcViewshedDialog(QDialog):
             QLabel(
                 f"Run viewshed analysis twice: first clip to original {LAYER_TA_POLYGONS} "
                 f"→ '{GROUP_VIEWSHED_WITH_TA}', then clip to {LAYER_CASCADE} "
-                f"→ '{GROUP_COMBINED_VIEWSHED}'. Both use timestamp subgroups and are "
-                "saved next to the project file."
+                f"→ '{GROUP_COMBINED_VIEWSHED}' (empty combined pockets are omitted; "
+                "timestamps with no visibility get a 'no line of sight' subgroup). "
+                "Saved next to the project file."
             )
         )
         self.btn_step4 = QPushButton(STEP_VIEWSHED)

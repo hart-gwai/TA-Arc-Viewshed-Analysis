@@ -29,6 +29,7 @@ from qgis.core import (
     QgsRasterLayer,
     QgsTask,
     QgsVectorLayer,
+    QgsWkbTypes,
 )
 from qgis.PyQt.QtCore import QVariant
 
@@ -57,6 +58,11 @@ GROUP_MASTER_VIEWSHEDS = "Master Viewshed"
 GROUP_VIEWSHED_WITH_TA = "Viewshed with TA"
 GROUP_COMBINED_VIEWSHED = "Combined Viewshed"
 GROUP_TIMESTAMPED_VIEWSHEDS = "Timestamped Viewshed Layers"
+VIEWSHED_OUTPUT_GROUPS = (
+    GROUP_MASTER_VIEWSHEDS,
+    GROUP_VIEWSHED_WITH_TA,
+    GROUP_COMBINED_VIEWSHED,
+)
 LEGACY_MASTER_VIEWSHED_GROUPS = (
     "Master Cell Site Viewshed",
     "Master Tower Viewsheds",
@@ -123,6 +129,7 @@ def _viewshed_layer_names(display_towers, pocket_id):
 
 
 RASTER_NODATA = -9999.0
+COMBINED_EMPTY_SUBGROUP_SUFFIX = " — no line of sight"
 
 
 def _read_raster_band(path):
@@ -181,12 +188,207 @@ def _array_to_binary(arr, nodata):
     return np.where(visible, 1.0, 0.0).astype(np.float32)
 
 
+def _raster_has_visible_cells(path):
+    """True when a clipped viewshed raster contains at least one visible cell."""
+    import numpy as np
+
+    arr, meta = _read_raster_band(path)
+    binary = _array_to_binary(arr, meta["nodata"])
+    return bool(np.any(binary >= 0.5))
+
+
 def _timestamp_subgroup_key(timestamp):
     """Legend subgroup from the pocket timestamp (first value if merged)."""
     raw = str(timestamp or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     if "|" in raw:
         raw = raw.split("|", 1)[0].strip()
     return _safe_group_name(raw)
+
+
+def _timestamp_sort_key(label):
+    """Sort timestamp labels chronologically when parseable."""
+    text = str(label or "").strip()
+    if not text:
+        return (1, "")
+    normalized = text.replace("_", ":")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return (0, datetime.strptime(normalized, fmt))
+        except ValueError:
+            continue
+    return (1, text)
+
+
+def _legend_subgroup_sort_key(name):
+    """Chronological sort key for Step 4 legend timestamp subgroups."""
+    text = str(name or "").strip()
+    if COMBINED_EMPTY_SUBGROUP_SUFFIX in text:
+        text = text.split(COMBINED_EMPTY_SUBGROUP_SUFFIX, 1)[0].strip()
+    return _timestamp_sort_key(text)
+
+
+def _repair_geometry(geom):
+    """Repair invalid geometries before GEOS boolean ops (avoids hard crashes)."""
+    if geom is None or geom.isEmpty():
+        return geom
+    if hasattr(geom, "isGeosValid") and not geom.isGeosValid():
+        repaired = geom.makeValid()
+        if repaired and not repaired.isEmpty():
+            return repaired
+    return geom
+
+
+def _arc_timestamp_from_feature(feat, timestamp_field):
+    """Normalize ping timestamp values to yyyy-MM-dd HH:mm:ss strings."""
+    if not timestamp_field:
+        return ""
+    from .csv_prep_engine import _format_timestamp
+
+    return _format_timestamp(feat[timestamp_field])
+
+
+def _normalize_polygon_for_export(geom):
+    """
+    Reduce cascade intersection results to polygon/multipolygon geometries.
+
+    GEOS intersections often return GeometryCollections (polygons + lines/points).
+    The QGIS memory provider silently drops those, which is why only ~122/413
+    pockets were being exported before normalization.
+    """
+    geom = _repair_geometry(geom)
+    if geom is None or geom.isEmpty():
+        return QgsGeometry()
+
+    if hasattr(geom, "makeValid"):
+        valid = geom.makeValid()
+        if valid and not valid.isEmpty():
+            geom = valid
+
+    flat = QgsWkbTypes.flatType(geom.wkbType())
+
+    if flat == QgsWkbTypes.GeometryCollection:
+        polygons = []
+        for part in geom.asGeometryCollection():
+            part_norm = _normalize_polygon_for_export(part)
+            if part_norm.isEmpty():
+                continue
+            part_flat = QgsWkbTypes.flatType(part_norm.wkbType())
+            if part_flat == QgsWkbTypes.Polygon:
+                polygons.append(part_norm.asPolygon())
+            elif part_flat == QgsWkbTypes.MultiPolygon:
+                polygons.extend(part_norm.asMultiPolygon())
+        if not polygons:
+            return QgsGeometry()
+        return QgsGeometry.fromMultiPolygonXY(polygons)
+
+    if flat in (QgsWkbTypes.Polygon, QgsWkbTypes.MultiPolygon):
+        return geom
+
+    try:
+        buffered = geom.buffer(0, 1)
+        if buffered and not buffered.isEmpty():
+            return _normalize_polygon_for_export(buffered)
+    except Exception:
+        pass
+
+    return QgsGeometry()
+
+
+def _prepare_geometry_for_export(geom):
+    """Backward-compatible wrapper for cascade export normalization."""
+    return _normalize_polygon_for_export(geom)
+
+
+def _write_cascade_pockets_to_gpkg(pockets, output_path, layer_name):
+    """
+    Write cascade pockets with OGR so complex intersection geometries export reliably.
+    Returns (written_count, skipped_count).
+    """
+    from osgeo import ogr, osr
+
+    if os.path.isfile(output_path):
+        os.remove(output_path)
+
+    driver = ogr.GetDriverByName("GPKG")
+    if driver is None:
+        raise RuntimeError("OGR GeoPackage driver is not available.")
+
+    dataset = driver.CreateDataSource(output_path)
+    if dataset is None:
+        raise RuntimeError(f"Could not create GeoPackage: {output_path}")
+
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(int(CRS_HK1980.authid().split(":")[1]))
+
+    ogr_layer = dataset.CreateLayer(layer_name, srs, ogr.wkbMultiPolygon)
+    if ogr_layer is None:
+        raise RuntimeError(f"Could not create layer '{layer_name}' in GeoPackage.")
+
+    for field_name, field_type, width in (
+        ("pocket_id", ogr.OFTInteger, 0),
+        ("cascade_rule", ogr.OFTString, 80),
+        ("Participating_Towers", ogr.OFTString, 254),
+        ("Timestamp", ogr.OFTString, 32),
+    ):
+        field = ogr.FieldDefn(field_name, field_type)
+        if width:
+            field.SetWidth(width)
+        ogr_layer.CreateField(field)
+
+    layer_defn = ogr_layer.GetLayerDefn()
+    written = 0
+    skipped = 0
+
+    for pocket_id, pocket in enumerate(pockets, start=1):
+        geom = _normalize_polygon_for_export(pocket["geometry"])
+        if geom.isEmpty():
+            skipped += 1
+            continue
+
+        ogr_geom = ogr.CreateGeometryFromWkt(geom.asWkt())
+        if ogr_geom is None:
+            skipped += 1
+            continue
+
+        ogr_geom = ogr.ForceToMultiPolygon(ogr_geom)
+        if ogr_geom is None or ogr_geom.IsEmpty():
+            skipped += 1
+            continue
+
+        ogr_feature = ogr.Feature(layer_defn)
+        ogr_feature.SetField("pocket_id", pocket_id)
+        ogr_feature.SetField("cascade_rule", pocket.get("rule", ""))
+        ogr_feature.SetField(
+            "Participating_Towers", "|".join(pocket.get("towers", []))
+        )
+        ogr_feature.SetField("Timestamp", pocket.get("timestamp", ""))
+        ogr_feature.SetGeometry(ogr_geom)
+
+        if ogr_layer.CreateFeature(ogr_feature) != 0:
+            skipped += 1
+        else:
+            written += 1
+
+    dataset = None
+    return written, skipped
+
+
+def _fallback_isolated_pockets(arcs):
+    """One pocket per arc when full cascade logic fails or returns nothing."""
+    pockets = []
+    for arc in arcs:
+        geom = _repair_geometry(arc.get("geometry"))
+        if geom is None or geom.isEmpty():
+            continue
+        pockets.append(
+            {
+                "geometry": geom,
+                "towers": [arc["tower"]],
+                "rule": "Rule 1 - No Overlap (fallback)",
+                "timestamp": arc.get("timestamp", ""),
+            }
+        )
+    return pockets
 
 
 def _raster_file_path(layer):
@@ -353,6 +555,17 @@ class TAArcViewshedEngine:
 
     def _save_vector_to_gpkg(self, memory_layer, output_path, layer_name):
         """Write a memory vector layer to GeoPackage and return the file layer."""
+        expected = memory_layer.featureCount()
+        if os.path.isfile(output_path):
+            try:
+                os.remove(output_path)
+            except OSError as exc:
+                self.log(
+                    f"Could not remove existing GeoPackage before save "
+                    f"({output_path}): {exc}",
+                    Qgis.Warning,
+                )
+
         processing.run(
             "native:savefeatures",
             {
@@ -364,6 +577,14 @@ class TAArcViewshedEngine:
         saved_layer = QgsVectorLayer(output_path, layer_name, "ogr")
         if not saved_layer.isValid():
             raise RuntimeError(f"Failed to load saved layer: {output_path}")
+
+        actual = saved_layer.featureCount()
+        if actual != expected:
+            raise RuntimeError(
+                f"GeoPackage save mismatch for '{layer_name}': wrote "
+                f"{expected} feature(s) in memory but loaded {actual} from disk. "
+                "Some cascade geometries may be invalid — check the message log."
+            )
         return saved_layer
 
     def _ensure_group(self, group_name):
@@ -373,16 +594,40 @@ class TAArcViewshedEngine:
             group = root.insertGroup(0, group_name)
         return group
 
+    def _timestamp_subgroup_insert_index(self, parent, child_name):
+        """Return insert index for newest-first timestamp subgroup ordering."""
+        from qgis.core import QgsLayerTreeGroup
+
+        new_key = _legend_subgroup_sort_key(child_name)
+        for index, child in enumerate(parent.children()):
+            if isinstance(child, QgsLayerTreeGroup):
+                if _legend_subgroup_sort_key(child.name()) < new_key:
+                    return index
+        return len(parent.children())
+
+    def _insert_timestamp_subgroup(self, parent, child_name):
+        """Create a timestamp subgroup at its sorted legend position."""
+        child = parent.findGroup(child_name)
+        if child is not None:
+            return child
+        index = self._timestamp_subgroup_insert_index(parent, child_name)
+        return parent.insertGroup(index, child_name)
+
     def _ensure_subgroup(self, parent_name, child_name):
         """Return a nested subgroup, creating parent/child groups if needed."""
         root = QgsProject.instance().layerTreeRoot()
         parent = root.findGroup(parent_name)
         if parent is None:
             parent = root.insertGroup(0, parent_name)
-        child = parent.findGroup(child_name)
-        if child is None:
-            child = parent.addGroup(child_name)
-        return child
+        return self._insert_timestamp_subgroup(parent, child_name)
+
+    def _prepare_timestamp_subgroups(self, parent_name, ts_keys):
+        """Pre-create timestamp subgroups newest-first before adding rasters."""
+        if not ts_keys:
+            return
+        parent = self._ensure_group(parent_name)
+        for ts_key in sorted(ts_keys, key=_legend_subgroup_sort_key, reverse=True):
+            self._insert_timestamp_subgroup(parent, ts_key)
 
     def _clear_layer_tree_group(self, group_name):
         """Remove a legend group and all layers inside it."""
@@ -435,6 +680,29 @@ class TAArcViewshedEngine:
             return feat[ts_field]
         return ""
 
+    def _ensure_empty_combined_subgroups(self, group_name, ts_stats):
+        """Legend placeholders for timestamps whose combined viewsheds are all empty."""
+        parent = QgsProject.instance().layerTreeRoot().findGroup(group_name)
+        if parent is None:
+            return
+        for ts_key, stats in ts_stats.items():
+            if stats.get("visible", 0) == 0 and stats.get("empty", 0) > 0:
+                label = f"{ts_key}{COMBINED_EMPTY_SUBGROUP_SUFFIX}"
+                empty_group = parent.findGroup(ts_key)
+                if empty_group is not None and not empty_group.findLayers():
+                    parent.removeChildNode(empty_group)
+                self._ensure_subgroup(group_name, label)
+                self.log(
+                    f"{group_name}/{label}: skipped {stats['empty']} empty "
+                    "combined viewshed pocket(s)."
+                )
+
+    def _hide_viewshed_group(self, group_name):
+        """Collapse viewshed output groups in the legend (hidden until user enables)."""
+        group = QgsProject.instance().layerTreeRoot().findGroup(group_name)
+        if group is not None:
+            group.setItemVisibilityChecked(False)
+
     def _run_viewshed_analysis_pass(
         self,
         polygon_layer,
@@ -454,8 +722,18 @@ class TAArcViewshedEngine:
         features = list(polygon_layer.getFeatures())
         total = len(features) or 1
         created_count = 0
+        skip_empty_combined = mode == "cascade"
+        ts_combined_stats = defaultdict(lambda: {"visible": 0, "empty": 0})
         work_dir = os.path.join(output_dir, work_subdir)
         os.makedirs(work_dir, exist_ok=True)
+
+        ts_keys = {
+            _timestamp_subgroup_key(self._timestamp_from_polygon_feature(feat))
+            for feat in features
+        }
+        ts_keys.discard("")
+        if not skip_empty_combined:
+            self._prepare_timestamp_subgroups(group_name, ts_keys)
 
         for idx, feat in enumerate(features):
             if cancel_fn and cancel_fn():
@@ -508,6 +786,18 @@ class TAArcViewshedEngine:
                     multiplied_path, mask_layer, clipped_path
                 )
 
+                if skip_empty_combined and not _raster_has_visible_cells(clipped_path):
+                    ts_combined_stats[ts_key]["empty"] += 1
+                    try:
+                        os.remove(clipped_path)
+                    except OSError:
+                        pass
+                    self.log(
+                        f"{layer_name}: no visible cells in combined viewshed; "
+                        f"skipped layer ({group_name}/{ts_key})."
+                    )
+                    continue
+
                 subgroup = self._ensure_subgroup(group_name, ts_key)
                 raster_layer = QgsRasterLayer(clipped_path, layer_name, "gdal")
                 if not raster_layer.isValid():
@@ -517,6 +807,8 @@ class TAArcViewshedEngine:
                 QgsProject.instance().addMapLayer(raster_layer, False)
                 subgroup.addLayer(raster_layer)
                 created_count += 1
+                if skip_empty_combined:
+                    ts_combined_stats[ts_key]["visible"] += 1
                 self.log(
                     f"{layer_name}: saved to {clipped_path} and added under "
                     f"{group_name}/{ts_key}"
@@ -527,6 +819,9 @@ class TAArcViewshedEngine:
                     Qgis.Warning,
                 )
                 self.log(traceback.format_exc(), Qgis.Warning)
+
+        if skip_empty_combined:
+            self._ensure_empty_combined_subgroups(group_name, ts_combined_stats)
 
         if progress_callback:
             progress_callback(100)
@@ -753,9 +1048,7 @@ class TAArcViewshedEngine:
         geom = self.build_arc_sector_polygon(
             site["point"], min_r, max_r, start_az, end_az
         )
-        timestamp = ""
-        if field_map["timestamp"]:
-            timestamp = str(feat[field_map["timestamp"]] or "")
+        timestamp = _arc_timestamp_from_feature(feat, field_map["timestamp"])
 
         return {
             "tower": tower,
@@ -1076,6 +1369,7 @@ class TAArcViewshedEngine:
                 f"skipped {len(self.skipped_master_viewsheds)} tower(s).",
                 Qgis.Warning,
             )
+        self._hide_viewshed_group(GROUP_MASTER_VIEWSHEDS)
         return True
 
     # ----------------------------------------------------------- Step 3
@@ -1083,28 +1377,114 @@ class TAArcViewshedEngine:
         """
         Translate CSV arcs to curved polygons and apply 3-tier cascade logic:
 
-        Rule 1 — No overlap: retain isolated arc remnants.
-        Rule 2 — Primary overlap: keep pairwise intersection A ∩ B.
-        Rule 3 — Secondary overlap: when primary pockets overlap, keep only the
-                 mutual core where all participating sectors meet.
+        Rule 1 — Only when no arc polygons overlap in the timestamp: keep every arc.
+        Rule 2 — When at least one overlap exists: keep pairwise overlap pockets only.
+        Rule 3 — When multiple overlap pockets intersect: add mutual-core pockets;
+                 lone non-overlapping arc areas are discarded so overlap data is kept.
         """
         field_map = self._resolve_field_map(ping_layer)
         site_lookup = self._site_lookup(sites_layer)
+        ping_count = ping_layer.featureCount()
+        self.log(f"Step 3 input: {ping_count} ping feature(s) in '{ping_layer.name()}'.")
 
         arcs = []
+        unknown_towers = set()
         total = ping_layer.featureCount() or 1
         for i, feat in enumerate(ping_layer.getFeatures()):
             if progress_callback and i % 25 == 0:
                 progress_callback(int(30 * i / total))
+            tower = _tower_key(feat[field_map["tower"]])
+            if tower not in site_lookup:
+                unknown_towers.add(str(feat[field_map["tower"]] or tower))
+                continue
             arc = self._build_arc_from_ping(feat, field_map, site_lookup)
             if arc["geometry"] and not arc["geometry"].isEmpty():
-                arcs.append(arc)
+                arc["geometry"] = _repair_geometry(arc["geometry"])
+                if not arc["geometry"].isEmpty():
+                    arcs.append(arc)
+
+        if unknown_towers:
+            sample = ", ".join(sorted(unknown_towers)[:8])
+            extra = "" if len(unknown_towers) <= 8 else f" (+{len(unknown_towers) - 8} more)"
+            raise ValueError(
+                f"{len(unknown_towers)} ping(s) reference tower(s) not in Unique Cell Sites "
+                f"({sample}{extra}). Re-run Prepare Cell Site Data (Step 1) after updating the CSV."
+            )
 
         if not arcs:
             raise ValueError("No arc geometries could be built from ping layer.")
 
+        arc_timestamps = sorted(
+            {str(arc.get("timestamp") or "").strip() or "Unknown" for arc in arcs},
+            key=_timestamp_sort_key,
+        )
+        self.log(
+            f"Built {len(arcs)} arc(s); timestamp range "
+            f"{arc_timestamps[0]} -> {arc_timestamps[-1]} ({len(arc_timestamps)} groups)."
+        )
+
         if progress_callback:
-            progress_callback(40)
+            progress_callback(35)
+
+        by_timestamp = defaultdict(list)
+        for arc in arcs:
+            ts = str(arc.get("timestamp") or "").strip() or "Unknown"
+            by_timestamp[ts].append(arc)
+
+        ts_groups = sorted(by_timestamp.items(), key=lambda item: _timestamp_sort_key(item[0]))
+        self.log(
+            f"Cascade analysis: {len(arcs)} arc(s) across {len(ts_groups)} timestamp group(s)."
+        )
+
+        pockets = []
+        failed_groups = []
+        for gi, (ts_label, ts_arcs) in enumerate(ts_groups):
+            if progress_callback:
+                progress_callback(40 + int(30 * (gi + 1) / max(len(ts_groups), 1)))
+            try:
+                group_pockets = self._apply_cascade_logic(ts_arcs)
+                if not group_pockets:
+                    self.log(
+                        f"  {ts_label}: cascade returned 0 pockets for "
+                        f"{len(ts_arcs)} arc(s); using fallback.",
+                        Qgis.Warning,
+                    )
+                    group_pockets = _fallback_isolated_pockets(ts_arcs)
+            except Exception as exc:
+                failed_groups.append(ts_label)
+                self.log(
+                    f"  {ts_label}: cascade failed ({exc}); using fallback for "
+                    f"{len(ts_arcs)} arc(s).",
+                    Qgis.Critical,
+                )
+                self.log(traceback.format_exc(), Qgis.Warning)
+                group_pockets = _fallback_isolated_pockets(ts_arcs)
+
+            pockets.extend(group_pockets)
+            self.log(
+                f"  {ts_label}: {len(ts_arcs)} arc(s) -> {len(group_pockets)} pocket(s)."
+            )
+
+        if failed_groups:
+            self.log(
+                f"Cascade used fallback for {len(failed_groups)} timestamp group(s): "
+                f"{', '.join(failed_groups[:5])}"
+                + (f" (+{len(failed_groups) - 5} more)" if len(failed_groups) > 5 else ""),
+                Qgis.Warning,
+            )
+
+        pocket_timestamps = sorted(
+            {str(p.get("timestamp") or "").strip() or "Unknown" for p in pockets},
+            key=_timestamp_sort_key,
+        )
+        if pocket_timestamps:
+            self.log(
+                f"Cascade output timestamps: {pocket_timestamps[0]} -> "
+                f"{pocket_timestamps[-1]} ({len(pocket_timestamps)} distinct value(s))."
+            )
+
+        if progress_callback:
+            progress_callback(70)
 
         for name in (LAYER_TA_POLYGONS, LAYER_CASCADE, LEGACY_LAYER_CASCADE, "Cascade_Polygons"):
             existing = self.find_layer_by_name(name)
@@ -1119,47 +1499,28 @@ class TAArcViewshedEngine:
         self._add_layer_at_project_root(saved_original)
         self.log(f"Saved original TA polygons to: {original_path}")
 
-        pockets = self._apply_cascade_logic(arcs)
-
-        if progress_callback:
-            progress_callback(70)
-
-        layer = QgsVectorLayer(
-            f"Polygon?crs={CRS_HK1980.authid()}", LAYER_CASCADE, "memory"
-        )
-        provider = layer.dataProvider()
-        provider.addAttributes(
-            [
-                QgsField("pocket_id", QVariant.Int),
-                QgsField("cascade_rule", QVariant.String),
-                QgsField("Participating_Towers", QVariant.String),
-                QgsField("Timestamp", QVariant.String),
-            ]
-        )
-        layer.updateFields()
-
-        out_features = []
-        for pocket_id, pocket in enumerate(pockets, start=1):
-            geom = pocket["geometry"]
-            if geom is None or geom.isEmpty():
-                continue
-            feat = QgsFeature(layer.fields())
-            feat.setGeometry(geom)
-            feat.setAttributes(
-                [
-                    pocket_id,
-                    pocket["rule"],
-                    "|".join(pocket["towers"]),
-                    pocket.get("timestamp", ""),
-                ]
-            )
-            out_features.append(feat)
-
-        provider.addFeatures(out_features)
-        layer.updateExtents()
-
         output_path = self._cascade_polygons_output_path()
-        saved_layer = self._save_vector_to_gpkg(layer, output_path, LAYER_CASCADE)
+        written, skipped = _write_cascade_pockets_to_gpkg(
+            pockets, output_path, LAYER_CASCADE
+        )
+        if skipped:
+            self.log(
+                f"Skipped {skipped} cascade pocket(s) that could not be converted "
+                "to exportable polygons.",
+                Qgis.Warning,
+            )
+
+        saved_layer = QgsVectorLayer(output_path, LAYER_CASCADE, "ogr")
+        if not saved_layer.isValid():
+            raise RuntimeError(f"Failed to load saved cascade layer: {output_path}")
+
+        loaded_count = saved_layer.featureCount()
+        if loaded_count != written:
+            raise RuntimeError(
+                f"Cascade GeoPackage mismatch: wrote {written} feature(s) but "
+                f"loaded {loaded_count} from {output_path}."
+            )
+
         self._add_layer_at_project_root(saved_layer)
         self.log(f"Saved cascade polygons to: {output_path}")
 
@@ -1167,7 +1528,7 @@ class TAArcViewshedEngine:
             progress_callback(100)
 
         self.log(
-            f"Cascade polygons: {len(out_features)} pocket(s); "
+            f"Cascade polygons: {loaded_count} pocket(s) exported; "
             f"{len(arcs)} original arc polygon(s)."
         )
         return saved_layer
@@ -1213,13 +1574,19 @@ class TAArcViewshedEngine:
     def _apply_cascade_logic(self, arcs):
         """
         Build pocket list from arc sectors using 3-tier cascade rules.
+
+        Rule 1 applies only when no overlaps exist in the timestamp (keep all arcs).
+        When any overlap exists, only Rule 2/3 overlap pockets are kept; lone arcs
+        and non-overlapping arc remnants are discarded.
         """
         n = len(arcs)
+        for arc in arcs:
+            arc["geometry"] = _repair_geometry(arc["geometry"])
 
         def _intersection_geom(indices):
             geom = QgsGeometry(arcs[indices[0]]["geometry"])
             for idx in indices[1:]:
-                geom = geom.intersection(arcs[idx]["geometry"])
+                geom = _repair_geometry(geom.intersection(arcs[idx]["geometry"]))
                 if geom.isEmpty():
                     break
             return geom
@@ -1228,7 +1595,9 @@ class TAArcViewshedEngine:
         primary_pockets = []
         for i in range(n):
             for j in range(i + 1, n):
-                inter = arcs[i]["geometry"].intersection(arcs[j]["geometry"])
+                inter = _repair_geometry(
+                    arcs[i]["geometry"].intersection(arcs[j]["geometry"])
+                )
                 if inter.isEmpty():
                     continue
                 towers = sorted({arcs[i]["tower"], arcs[j]["tower"]})
@@ -1295,35 +1664,25 @@ class TAArcViewshedEngine:
             p for idx, p in enumerate(primary_pockets) if idx not in absorbed_primary
         ]
 
-        # --- Rule 1: isolated remnants ---
-        overlap_union_by_arc = [QgsGeometry() for _ in range(n)]
-        for pocket in surviving_primaries + secondary_pockets:
-            for arc_idx in range(n):
-                if arcs[arc_idx]["tower"] in pocket["towers"]:
-                    g = pocket["geometry"]
-                    overlap_union_by_arc[arc_idx] = (
-                        overlap_union_by_arc[arc_idx].combine(g)
-                        if not overlap_union_by_arc[arc_idx].isEmpty()
-                        else QgsGeometry(g)
-                    )
+        if not primary_pockets:
+            # Rule 1 — no overlaps in this timestamp: keep every full arc.
+            isolated_pockets = []
+            for arc in arcs:
+                geom = _repair_geometry(arc["geometry"])
+                if geom.isEmpty():
+                    continue
+                isolated_pockets.append(
+                    {
+                        "geometry": geom,
+                        "towers": [arc["tower"]],
+                        "rule": "Rule 1 - No Overlap",
+                        "timestamp": arc.get("timestamp", ""),
+                    }
+                )
+            return isolated_pockets
 
-        isolated_pockets = []
-        for i, arc in enumerate(arcs):
-            remainder = arc["geometry"]
-            if not overlap_union_by_arc[i].isEmpty():
-                remainder = remainder.difference(overlap_union_by_arc[i])
-            if remainder.isEmpty():
-                continue
-            isolated_pockets.append(
-                {
-                    "geometry": remainder,
-                    "towers": [arc["tower"]],
-                    "rule": "Rule 1 - No Overlap",
-                    "timestamp": arc["timestamp"],
-                }
-            )
-
-        return isolated_pockets + surviving_primaries + secondary_pockets
+        # Rule 2 + Rule 3 — overlaps exist: keep overlap pockets only, discard lone arcs.
+        return surviving_primaries + secondary_pockets
 
     @staticmethod
     def _merge_timestamps(arc_a, arc_b):
@@ -1516,6 +1875,8 @@ class TAArcViewshedEngine:
             f"'{GROUP_VIEWSHED_WITH_TA}', {combined_count} layer(s) in "
             f"'{GROUP_COMBINED_VIEWSHED}'."
         )
+        for group_name in (GROUP_VIEWSHED_WITH_TA, GROUP_COMBINED_VIEWSHED):
+            self._hide_viewshed_group(group_name)
         return True
 
 
