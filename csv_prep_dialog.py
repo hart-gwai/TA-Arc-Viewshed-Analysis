@@ -200,6 +200,18 @@ class CsvPrepDialog(QDialog):
         mapping_layout.addLayout(arc_form)
         layout.addWidget(mapping_group)
 
+        # --- Time Aggregation ---
+        time_group = QGroupBox("Time Aggregation")
+        time_layout = QFormLayout(time_group)
+        self.spin_time_bin = QDoubleSpinBox()
+        self.spin_time_bin.setDecimals(0)
+        self.spin_time_bin.setRange(0, 1440)
+        self.spin_time_bin.setValue(5)
+        self.spin_time_bin.setSuffix(" minutes (0 to disable)")
+        time_layout.addRow(QLabel("Aggregate ping timestamps and TA min/max radii by bin size:"))
+        time_layout.addRow("Time Bin Size:", self.spin_time_bin)
+        layout.addWidget(time_group)
+
         refresh_btn = QPushButton("Reload columns from source")
         refresh_btn.clicked.connect(self._reload_columns)
         layout.addWidget(refresh_btn)
@@ -406,6 +418,7 @@ class CsvPrepDialog(QDialog):
                 fill_tower_from_buildings=fill_from_buildings,
                 dem_layer=self.dem_layer_combo.currentLayer(),
                 azimuth_delta=self.spin_azimuth_delta.value(),
+                time_bin_minutes=int(self.spin_time_bin.value()),
             )
 
             sites_layer = None

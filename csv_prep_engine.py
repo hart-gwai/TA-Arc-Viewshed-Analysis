@@ -608,6 +608,62 @@ class CsvPrepEngine:
             )
         return cleaned
 
+    def _apply_time_binning(self, features, bin_minutes, fields):
+        """
+        Group features by (Cell_Site, Rounded_Timestamp, Start_Azimuth, End_Azimuth)
+        and aggregate TA ranges: min(Min_Radius), max(Max_Radius).
+        """
+        from datetime import timedelta
+
+        grouped = defaultdict(list)
+        for feat in features:
+            tower = feat[OUT_TOWER]
+            start_az = feat[OUT_START_AZ]
+            end_az = feat[OUT_END_AZ]
+            timestamp_str = feat[OUT_TIMESTAMP]
+
+            # Parse and floor timestamp
+            if not timestamp_str:
+                binned_ts = ""
+            else:
+                try:
+                    dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                    # Floor to nearest bin_minutes
+                    minute_offset = dt.minute % bin_minutes
+                    floored_dt = dt - timedelta(minutes=minute_offset, seconds=dt.second, microseconds=dt.microsecond)
+                    binned_ts = floored_dt.strftime("%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    binned_ts = timestamp_str
+
+            group_key = (tower, binned_ts, start_az, end_az)
+            grouped[group_key].append(feat)
+
+        binned_features = []
+        for (tower, binned_ts, start_az, end_az), group_feats in grouped.items():
+            if not group_feats:
+                continue
+
+            min_r = min(f[OUT_MIN_R] for f in group_feats)
+            max_r = max(f[OUT_MAX_R] for f in group_feats)
+            observer_h = group_feats[0][OUT_OBSERVER_H]
+            geom = group_feats[0].geometry()
+
+            out_feat = QgsFeature(fields)
+            out_feat.setGeometry(QgsGeometry(geom))
+            out_feat.setAttributes([
+                tower,
+                min_r,
+                max_r,
+                start_az,
+                end_az,
+                binned_ts,
+                observer_h
+            ])
+            binned_features.append(out_feat)
+
+        self.log(f"Time binning ({bin_minutes} mins) reduced {len(features)} raw records to {len(binned_features)} aggregated points.")
+        return binned_features
+
     def prepare_layer(
         self,
         source_layer,
@@ -618,6 +674,7 @@ class CsvPrepEngine:
         fill_tower_from_buildings=False,
         dem_layer=None,
         azimuth_delta=45.0,
+        time_bin_minutes=0,
     ):
         """
         Build Prepared_Ping_Layer from *source_layer* using column *mapping*.
@@ -708,6 +765,9 @@ class CsvPrepEngine:
 
             min_r = _safe_float(feat[mapping["min_r"]])
             max_r = _safe_float(feat[mapping["max_r"]])
+            if min_r is None or max_r is None or math.isnan(min_r) or math.isnan(max_r):
+                skipped_geom += 1
+                continue
 
             attrs = {
                 OUT_START_AZ: feat[mapping["start_az"]] if not _is_none_choice(mapping.get("start_az")) else 0,
@@ -748,6 +808,9 @@ class CsvPrepEngine:
                 ]
             )
             out_features.append(out_feat)
+
+        if time_bin_minutes > 0:
+            out_features = self._apply_time_binning(out_features, time_bin_minutes, out_layer.fields())
 
         if not out_features:
             raise ValueError(
