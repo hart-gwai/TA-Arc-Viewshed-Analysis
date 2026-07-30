@@ -237,15 +237,42 @@ def _format_timestamp_range_label(start_key, end_key):
     if not end_key or start_key == end_key:
         return start_key
 
-    start_parts = start_key.rsplit(" ", 1)
-    end_parts = end_key.rsplit(" ", 1)
+    # Extract the absolute start and end times if the keys are already ranges (Rolling Window).
+    def _extract_start_end(key):
+        parts = key.split("-")
+        if len(parts) == 3:  # e.g. "2026-07-17 18_48_00-18_53_00"
+            date_part = parts[0] + "-" + parts[1]
+            time_parts = parts[2].split(" ", 1)
+            if len(time_parts) == 2:
+                # date_part = "2026-07", time_parts = ["17", "18_48_00-18_53_00"]
+                # Actually, an easier way is just to split by space, then by dash on the second part.
+                pass
+        
+        # simpler parsing:
+        # A rolling window key looks like "2026-07-17 18_48_00-18_53_00"
+        # A standard key looks like "2026-07-17 18_48_00"
+        
+        space_parts = key.rsplit(" ", 1)
+        if len(space_parts) == 2:
+            date_str = space_parts[0]
+            time_str = space_parts[1]
+            time_ranges = time_str.split("-")
+            return f"{date_str} {time_ranges[0]}", f"{date_str} {time_ranges[-1]}"
+        return key, key
+
+    actual_start, _ = _extract_start_end(start_key)
+    _, actual_end = _extract_start_end(end_key)
+
+    start_parts = actual_start.rsplit(" ", 1)
+    end_parts = actual_end.rsplit(" ", 1)
+
     if (
         len(start_parts) == 2
         and len(end_parts) == 2
         and start_parts[0] == end_parts[0]
     ):
         return _safe_group_name(f"{start_parts[0]} {start_parts[1]}-{end_parts[1]}")
-    return _safe_group_name(f"{start_key}-{end_key}")
+    return _safe_group_name(f"{actual_start}-{actual_end}")
 
 
 def _timestamps_are_adjacent(previous_key, current_key, ordered_ts_keys):
@@ -1037,7 +1064,7 @@ class TAArcViewshedEngine:
         features = list(polygon_layer.getFeatures())
         total = len(features) or 1
         skip_empty_combined = mode == "cascade"
-        merge_timestamp_ranges = True
+        merge_timestamp_ranges = False
         ts_combined_stats = defaultdict(lambda: {"visible": 0, "empty": 0})
         work_dir = os.path.join(output_dir, work_subdir)
         os.makedirs(work_dir, exist_ok=True)
@@ -1677,8 +1704,81 @@ class TAArcViewshedEngine:
         self._apply_default_multicolour_symbology([GROUP_MASTER_VIEWSHEDS])
         return True
 
+    def _apply_rolling_window_to_arcs(self, arcs, rolling_window):
+        """
+        Group arcs by sequential timestamps, applying a rolling window
+        (e.g., window size 3 bins, step 1 bin) and combining arcs of the same tower.
+        """
+        if not rolling_window or rolling_window.get("window_size", 1) <= 1:
+            return arcs
+
+        window_size = rolling_window["window_size"]
+        step_size = rolling_window["step_size"]
+
+        unique_times = sorted(
+            {str(arc.get("timestamp") or "").strip() or "Unknown" for arc in arcs},
+            key=_timestamp_sort_key,
+        )
+
+        if len(unique_times) < window_size:
+            self.log(
+                f"Rolling window size ({window_size}) is larger than unique timestamps ({len(unique_times)}). Using full range.",
+                Qgis.Warning,
+            )
+
+        arcs_by_time = defaultdict(list)
+        for arc in arcs:
+            ts = str(arc.get("timestamp") or "").strip() or "Unknown"
+            arcs_by_time[ts].append(arc)
+
+        rolled_arcs = []
+        i = 0
+        while i < len(unique_times):
+            window_times = unique_times[i : i + window_size]
+            if not window_times:
+                break
+
+            start_t = window_times[0]
+            end_t = window_times[-1]
+            range_label = _format_timestamp_range_label(start_t, end_t)
+
+            window_arcs_by_tower = defaultdict(list)
+            for t in window_times:
+                for arc in arcs_by_time[t]:
+                    window_arcs_by_tower[arc["tower"]].append(arc)
+
+            for tower, tower_arcs in window_arcs_by_tower.items():
+                if len(tower_arcs) == 1:
+                    new_arc = dict(tower_arcs[0])
+                    new_arc["timestamp"] = range_label
+                    rolled_arcs.append(new_arc)
+                else:
+                    # Dissolve (Union) all arcs for this tower in this time window
+                    combined_geom = QgsGeometry()
+                    for arc in tower_arcs:
+                        geom = arc["geometry"]
+                        if combined_geom.isEmpty():
+                            combined_geom = QgsGeometry(geom)
+                        else:
+                            combined_geom = combined_geom.combine(geom)
+
+                    combined_geom = _repair_geometry(combined_geom)
+
+                    new_arc = dict(tower_arcs[0])
+                    new_arc["geometry"] = combined_geom
+                    new_arc["timestamp"] = range_label
+                    rolled_arcs.append(new_arc)
+
+            i += step_size
+
+        self.log(
+            f"Rolling window (size={window_size}, step={step_size}) generated {len(rolled_arcs)} "
+            f"dissolved arcs from {len(arcs)} base arcs."
+        )
+        return rolled_arcs
+
     # ----------------------------------------------------------- Step 3
-    def run_cascade_polygons(self, ping_layer, sites_layer, progress_callback=None):
+    def run_cascade_polygons(self, ping_layer, sites_layer, rolling_window=None, progress_callback=None):
         """
         Translate CSV arcs to curved polygons and apply 3-tier cascade logic:
 
@@ -1718,6 +1818,8 @@ class TAArcViewshedEngine:
 
         if not arcs:
             raise ValueError("No arc geometries could be built from ping layer.")
+
+        arcs = self._apply_rolling_window_to_arcs(arcs, rolling_window)
 
         arc_timestamps = sorted(
             {str(arc.get("timestamp") or "").strip() or "Unknown" for arc in arcs},
