@@ -5,6 +5,7 @@ spatial join, and output a standardized ping point layer for the main workflow.
 """
 
 import csv
+import math
 import os
 import re
 from collections import defaultdict

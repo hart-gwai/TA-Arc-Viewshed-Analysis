@@ -140,6 +140,31 @@ class TAArcViewshedDialog(QDialog):
                 f"when they do), and save {LAYER_TA_POLYGONS} and {LAYER_CASCADE}."
             )
         )
+
+        # --- Rolling Window Settings ---
+        from qgis.PyQt.QtWidgets import QCheckBox, QDoubleSpinBox, QFormLayout, QWidget
+        self.check_rolling_window = QCheckBox("Apply rolling time window across sequential timestamps")
+        self.check_rolling_window.toggled.connect(self._on_rolling_toggled)
+        step3_layout.addWidget(self.check_rolling_window)
+
+        self.rolling_options = QWidget()
+        rolling_form = QFormLayout(self.rolling_options)
+        rolling_form.setContentsMargins(20, 0, 0, 0)
+        self.spin_window_size = QDoubleSpinBox()
+        self.spin_window_size.setDecimals(0)
+        self.spin_window_size.setRange(1, 100)
+        self.spin_window_size.setValue(3)
+        self.spin_window_size.setSuffix(" sequential timestamps")
+        rolling_form.addRow("Window Size:", self.spin_window_size)
+        self.spin_step_size = QDoubleSpinBox()
+        self.spin_step_size.setDecimals(0)
+        self.spin_step_size.setRange(1, 100)
+        self.spin_step_size.setValue(1)
+        self.spin_step_size.setSuffix(" timestamp(s) forward")
+        rolling_form.addRow("Step Size:", self.spin_step_size)
+        step3_layout.addWidget(self.rolling_options)
+        self.rolling_options.setVisible(False)
+
         self.btn_step3 = QPushButton(STEP_TA_POLYGON)
         self.btn_step3.clicked.connect(self._run_step3)
         step3_layout.addWidget(self.btn_step3)
@@ -165,6 +190,9 @@ class TAArcViewshedDialog(QDialog):
 
     def _log(self, message, level=Qgis.Info):
         QgsMessageLog.logMessage(message, LOG_TAG, level)
+
+    def _on_rolling_toggled(self, checked):
+        self.rolling_options.setVisible(checked)
 
     def _set_busy(self, busy):
         for btn in (self.btn_step1, self.btn_step2, self.btn_step3, self.btn_step4):
@@ -319,10 +347,18 @@ class TAArcViewshedDialog(QDialog):
         self._set_busy(True)
         self.progress_bar.setValue(0)
 
+        rolling_window_opts = None
+        if self.check_rolling_window.isChecked():
+            rolling_window_opts = {
+                "window_size": int(self.spin_window_size.value()),
+                "step_size": int(self.spin_step_size.value()),
+            }
+
         try:
             layer = self.engine.run_cascade_polygons(
                 ping_layer,
                 sites_layer,
+                rolling_window=rolling_window_opts,
                 progress_callback=self._on_progress,
             )
             self.progress_bar.setValue(100)

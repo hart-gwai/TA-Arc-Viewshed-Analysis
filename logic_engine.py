@@ -935,7 +935,7 @@ class TAArcViewshedEngine:
     def _compute_clipped_viewshed_binary(
         self, feat, mode, feature_key, towers, display_towers, work_dir
     ):
-        """Build a clipped binary viewshed array for one polygon feature."""
+        """Build a clipped binary viewshed array for one polygon feature using in-memory GDAL and caching."""
         raster_paths = [
             self.master_viewshed_paths[t]
             for t in towers
@@ -944,29 +944,111 @@ class TAArcViewshedEngine:
         if not raster_paths:
             return None
 
-        _, file_stem = _viewshed_layer_names(display_towers, feature_key)
-        multiplied_path = os.path.join(work_dir, f"{file_stem}_multiplied.tif")
-        bbox = feat.geometry().boundingBox()
-        bbox.grow(max(bbox.width(), bbox.height()) * 0.01 + 1.0)
-        projwin = (
-            f"{bbox.xMinimum()},{bbox.xMaximum()},"
-            f"{bbox.yMinimum()},{bbox.yMaximum()}"
-        )
+        layer_name, file_stem = _viewshed_layer_names(display_towers, feature_key)
 
-        self._combine_viewsheds(
-            raster_paths, feature_key, projwin, work_dir, multiplied_path
-        )
-        mask_layer = self._vector_mask_from_feature(feat, feature_key)
-        binary, meta = self._clip_viewshed_to_binary_array(
-            multiplied_path, mask_layer
-        )
-        return {
-            "binary": binary,
-            "meta": meta,
-            "digest": _binary_visibility_digest(binary, meta),
-            "layer_name": _viewshed_layer_names(display_towers, feature_key)[0],
-            "file_stem": file_stem,
-        }
+        # --- Geometry Cache (#2: Eliminates redundant math for stationary/slow targets) ---
+        cache_key = (feat.geometry().asWkt(), tuple(sorted(towers)))
+        if not hasattr(self, "_pocket_cache"):
+            self._pocket_cache = {}
+            
+        if cache_key in self._pocket_cache:
+            cached = self._pocket_cache[cache_key]
+            return {
+                "binary": cached["binary"],
+                "meta": cached["meta"],
+                "digest": cached["digest"],
+                "layer_name": layer_name,
+                "file_stem": file_stem,
+            }
+
+        # --- In-Memory NumPy Processing (#1: Eliminates disk I/O bottlenecks) ---
+        from osgeo import gdal
+        import uuid
+        import json
+
+        bbox = feat.geometry().boundingBox()
+        # Add 1.0 buffer to ensure crop bounding box encompasses cutline
+        bbox.grow(max(bbox.width(), bbox.height()) * 0.01 + 1.0)
+        minX, maxX, minY, maxY = bbox.xMinimum(), bbox.xMaximum(), bbox.yMinimum(), bbox.yMaximum()
+
+        # Write mask geometry to an in-memory GeoJSON file for GDAL Warp cutline
+        # QGIS geom.asJson() returns a Geometry object, not a full FeatureCollection.
+        geom_json = feat.geometry().asJson()
+        geojson_str = json.dumps({
+            "type": "FeatureCollection",
+            "name": "mask",
+            "crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:EPSG::2326" } },
+            "features": [{"type": "Feature", "geometry": json.loads(geom_json), "properties": {"id": 1}}]
+        })
+        
+        mask_vsi_path = f"/vsimem/mask_{uuid.uuid4().hex}.geojson"
+        gdal.FileFromMemBuffer(mask_vsi_path, geojson_str.encode('utf-8'))
+
+        binary_layers = []
+        meta = None
+
+        try:
+            for path in raster_paths:
+                # Need to use standard dict options for Python GDAL bindings
+                ds = gdal.Warp(
+                    '', 
+                    path, 
+                    format='MEM',
+                    outputBounds=[minX, minY, maxX, maxY],
+                    cutlineDSName=mask_vsi_path,
+                    cropToCutline=True,
+                    srcNodata=-9999,
+                    dstNodata=-9999
+                )
+                
+                if not ds:
+                    raise RuntimeError(f"In-memory warp failed for {path} using cutline {mask_vsi_path}")
+                    
+                band = ds.GetRasterBand(1)
+                arr = band.ReadAsArray()
+                
+                if meta is None:
+                    meta = {
+                        "nodata": band.GetNoDataValue(),
+                        "geotransform": ds.GetGeoTransform(),
+                        "projection": ds.GetProjection(),
+                    }
+                    
+                binary_layers.append(_array_to_binary(arr, meta["nodata"]))
+                ds = None
+
+            if not binary_layers:
+                return None
+
+            # Multiply all tower visibility grids together
+            combined = binary_layers[0].copy()
+            for layer_arr in binary_layers[1:]:
+                if layer_arr.shape != combined.shape:
+                    min_rows = min(combined.shape[0], layer_arr.shape[0])
+                    min_cols = min(combined.shape[1], layer_arr.shape[1])
+                    combined = combined[:min_rows, :min_cols] * layer_arr[:min_rows, :min_cols]
+                else:
+                    combined = combined * layer_arr
+
+            digest = _binary_visibility_digest(combined, meta)
+
+            # Save to cache
+            self._pocket_cache[cache_key] = {
+                "binary": combined,
+                "meta": meta,
+                "digest": digest
+            }
+
+            return {
+                "binary": combined,
+                "meta": meta,
+                "digest": digest,
+                "layer_name": layer_name,
+                "file_stem": file_stem,
+            }
+
+        finally:
+            gdal.Unlink(mask_vsi_path)
 
     def _finalize_viewshed_pass_results(
         self,
@@ -1061,6 +1143,8 @@ class TAArcViewshedEngine:
         mode='ta' uses original TA polygons (single tower per feature).
         mode='cascade' uses TA polygon overlapped pockets.
         """
+        self._pocket_cache = {}  # Clear geometry cache per pass
+        
         features = list(polygon_layer.getFeatures())
         total = len(features) or 1
         skip_empty_combined = mode == "cascade"
