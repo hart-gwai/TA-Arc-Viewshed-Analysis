@@ -703,6 +703,16 @@ class TAArcViewshedEngine:
         if group is not None:
             group.setItemVisibilityChecked(False)
 
+    def _apply_default_multicolour_symbology(self, group_names):
+        """Apply multicoloured symbology to freshly generated viewshed groups."""
+        from .symbology_engine import SYMBOL_MODE_MULTI, apply_viewshed_symbology
+
+        for group_name in group_names:
+            try:
+                apply_viewshed_symbology(group_name, SYMBOL_MODE_MULTI)
+            except ValueError:
+                pass
+
     def _run_viewshed_analysis_pass(
         self,
         polygon_layer,
@@ -1370,6 +1380,7 @@ class TAArcViewshedEngine:
                 Qgis.Warning,
             )
         self._hide_viewshed_group(GROUP_MASTER_VIEWSHEDS)
+        self._apply_default_multicolour_symbology([GROUP_MASTER_VIEWSHEDS])
         return True
 
     # ----------------------------------------------------------- Step 3
@@ -1877,6 +1888,9 @@ class TAArcViewshedEngine:
         )
         for group_name in (GROUP_VIEWSHED_WITH_TA, GROUP_COMBINED_VIEWSHED):
             self._hide_viewshed_group(group_name)
+        self._apply_default_multicolour_symbology(
+            [GROUP_VIEWSHED_WITH_TA, GROUP_COMBINED_VIEWSHED]
+        )
         return True
 
 
