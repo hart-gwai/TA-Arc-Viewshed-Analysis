@@ -6,6 +6,7 @@ Field names below match typical SAR cell-sector CSV exports. Adjust constants
 if your CSV uses different column headers.
 """
 
+import hashlib
 import math
 import os
 import re
@@ -153,7 +154,7 @@ def _read_raster_band(path):
 
 
 def _write_float32_raster(path, arr, meta, nodata=RASTER_NODATA):
-    """Write a single-band Float32 GeoTIFF."""
+    """Write a single-band Float32 GeoTIFF (internal processing intermediates)."""
     from osgeo import gdal
     import numpy as np
 
@@ -172,8 +173,32 @@ def _write_float32_raster(path, arr, meta, nodata=RASTER_NODATA):
     out_ds = None
 
 
+def _write_binary_viewshed_raster(path, arr, meta):
+    """Write a compressed single-band Byte GeoTIFF with values 0/1."""
+    from osgeo import gdal
+    import numpy as np
+
+    data = np.ascontiguousarray(np.asarray(arr), dtype=np.uint8)
+    driver = gdal.GetDriverByName("GTiff")
+    rows, cols = data.shape
+    out_ds = driver.Create(
+        path,
+        cols,
+        rows,
+        1,
+        gdal.GDT_Byte,
+        options=["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES"],
+    )
+    out_ds.SetGeoTransform(meta["geotransform"])
+    out_ds.SetProjection(meta["projection"])
+    out_band = out_ds.GetRasterBand(1)
+    out_band.WriteArray(data)
+    out_band.FlushCache()
+    out_ds = None
+
+
 def _array_to_binary(arr, nodata):
-    """Convert visibility values to Float32 0.0 (not visible) or 1.0 (visible)."""
+    """Convert visibility values to UInt8 0 (not visible) or 1 (visible)."""
     import numpy as np
 
     data = np.asarray(arr)
@@ -185,7 +210,160 @@ def _array_to_binary(arr, nodata):
             visible = visible & (data != nodata)
         except (TypeError, ValueError):
             pass
-    return np.where(visible, 1.0, 0.0).astype(np.float32)
+    return np.where(visible, 1, 0).astype(np.uint8)
+
+
+def _binary_visibility_digest(binary, meta):
+    """Stable hash for deduplicating identical clipped viewshed patterns."""
+    import numpy as np
+
+    data = np.ascontiguousarray(np.asarray(binary), dtype=np.uint8)
+    gt = meta.get("geotransform") or ()
+    gt_bytes = ",".join(f"{v:.6f}" for v in gt).encode("utf-8")
+    payload = (
+        f"{data.shape[0]}x{data.shape[1]}".encode("utf-8")
+        + b"\0"
+        + gt_bytes
+        + b"\0"
+        + data.tobytes()
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _format_timestamp_range_label(start_key, end_key):
+    """Build a legend subgroup label for one or more adjacent timestamps."""
+    if not start_key:
+        return end_key or "unknown"
+    if not end_key or start_key == end_key:
+        return start_key
+
+    start_parts = start_key.rsplit(" ", 1)
+    end_parts = end_key.rsplit(" ", 1)
+    if (
+        len(start_parts) == 2
+        and len(end_parts) == 2
+        and start_parts[0] == end_parts[0]
+    ):
+        return _safe_group_name(f"{start_parts[0]} {start_parts[1]}-{end_parts[1]}")
+    return _safe_group_name(f"{start_key}-{end_key}")
+
+
+def _timestamps_are_adjacent(previous_key, current_key, ordered_ts_keys):
+    """True when current_key immediately follows previous_key in time order."""
+    if not previous_key or not current_key:
+        return False
+    try:
+        prev_idx = ordered_ts_keys.index(previous_key)
+        curr_idx = ordered_ts_keys.index(current_key)
+    except ValueError:
+        return False
+    return curr_idx == prev_idx + 1
+
+
+def _timestamp_layer_fingerprint(records):
+    """Identity of all visible layers at one timestamp (layer name + pattern hash)."""
+    return frozenset((r["layer_name"], r["digest"]) for r in records)
+
+
+def _timestamp_fingerprints_compatible(fp_a, fp_b):
+    """True when overlapping layers share the same pattern at both timestamps."""
+    map_a = dict(fp_a)
+    map_b = dict(fp_b)
+    common = map_a.keys() & map_b.keys()
+    if not common:
+        return False
+    return all(map_a[name] == map_b[name] for name in common)
+
+
+def _merge_global_timestamp_ranges(all_records, ordered_ts_keys):
+    """
+    Collapse consecutive timestamps whose visible layer patterns match (#3).
+
+    Fingerprints use layer_name (not pocket-specific file_stem) so the same
+    tower or intersection merges across adjacent times even when pocket ids differ.
+    """
+    from collections import defaultdict
+
+    by_ts = defaultdict(list)
+    for rec in all_records:
+        by_ts[rec["ts_key"]].append(rec)
+
+    merged = []
+    current_start = None
+    current_end = None
+    current_by_layer = {}
+
+    for ts_key in ordered_ts_keys:
+        recs = by_ts.get(ts_key)
+        if not recs:
+            continue
+        layer_map = {r["layer_name"]: r for r in recs}
+
+        if current_start is None:
+            current_start = ts_key
+            current_end = ts_key
+            current_by_layer = dict(layer_map)
+            continue
+
+        current_fp = _timestamp_layer_fingerprint(current_by_layer.values())
+        new_fp = _timestamp_layer_fingerprint(recs)
+        if (
+            current_fp == new_fp
+            and _timestamps_are_adjacent(current_end, ts_key, ordered_ts_keys)
+        ):
+            current_end = ts_key
+            continue
+
+        if (
+            _timestamp_fingerprints_compatible(current_fp, new_fp)
+            and _timestamps_are_adjacent(current_end, ts_key, ordered_ts_keys)
+        ):
+            current_end = ts_key
+            for name, rec in layer_map.items():
+                current_by_layer.setdefault(name, rec)
+            continue
+
+        range_key = _format_timestamp_range_label(current_start, current_end)
+        for rec in current_by_layer.values():
+            item = dict(rec)
+            item["start_key"] = current_start
+            item["end_key"] = current_end
+            item["range_key"] = range_key
+            merged.append(item)
+
+        current_start = ts_key
+        current_end = ts_key
+        current_by_layer = dict(layer_map)
+
+    if current_start is not None:
+        range_key = _format_timestamp_range_label(current_start, current_end)
+        for rec in current_by_layer.values():
+            item = dict(rec)
+            item["start_key"] = current_start
+            item["end_key"] = current_end
+            item["range_key"] = range_key
+            merged.append(item)
+    return merged
+
+
+class _ViewshedPatternRegistry:
+    """Dedup identical viewshed rasters to one compressed GeoTIFF on disk."""
+
+    def __init__(self, output_dir):
+        self.pattern_dir = os.path.join(output_dir, "_patterns")
+        os.makedirs(self.pattern_dir, exist_ok=True)
+        self._paths = {}
+
+    def get_or_write(self, digest, binary, meta):
+        cached = self._paths.get(digest)
+        if cached and os.path.isfile(cached):
+            return cached
+
+        path = os.path.join(self.pattern_dir, f"{digest}.tif")
+        if not os.path.isfile(path):
+            _write_binary_viewshed_raster(path, binary, meta)
+        self._paths[digest] = path
+        return path
 
 
 def _raster_has_visible_cells(path):
@@ -194,7 +372,16 @@ def _raster_has_visible_cells(path):
 
     arr, meta = _read_raster_band(path)
     binary = _array_to_binary(arr, meta["nodata"])
-    return bool(np.any(binary >= 0.5))
+    return bool(np.any(binary > 0))
+
+
+def _compress_viewshed_file_in_place(path):
+    """Re-encode an on-disk viewshed as compressed Byte 0/1 (#4)."""
+    arr, meta = _read_raster_band(path)
+    binary = _array_to_binary(arr, meta["nodata"])
+    temp_path = f"{path}.compressing.tif"
+    _write_binary_viewshed_raster(temp_path, binary, meta)
+    os.replace(temp_path, path)
 
 
 def _timestamp_subgroup_key(timestamp):
@@ -224,6 +411,11 @@ def _legend_subgroup_sort_key(name):
     text = str(name or "").strip()
     if COMBINED_EMPTY_SUBGROUP_SUFFIX in text:
         text = text.split(COMBINED_EMPTY_SUBGROUP_SUFFIX, 1)[0].strip()
+    if " " in text and "-" in text.rsplit(" ", 1)[-1]:
+        date_part, rest = text.rsplit(" ", 1)
+        if "_" in rest and "-" in rest:
+            start_time = rest.split("-", 1)[0]
+            text = f"{date_part} {start_time}"
     return _timestamp_sort_key(text)
 
 
@@ -713,6 +905,119 @@ class TAArcViewshedEngine:
             except ValueError:
                 pass
 
+    def _compute_clipped_viewshed_binary(
+        self, feat, mode, feature_key, towers, display_towers, work_dir
+    ):
+        """Build a clipped binary viewshed array for one polygon feature."""
+        raster_paths = [
+            self.master_viewshed_paths[t]
+            for t in towers
+            if t in self.master_viewshed_paths
+        ]
+        if not raster_paths:
+            return None
+
+        _, file_stem = _viewshed_layer_names(display_towers, feature_key)
+        multiplied_path = os.path.join(work_dir, f"{file_stem}_multiplied.tif")
+        bbox = feat.geometry().boundingBox()
+        bbox.grow(max(bbox.width(), bbox.height()) * 0.01 + 1.0)
+        projwin = (
+            f"{bbox.xMinimum()},{bbox.xMaximum()},"
+            f"{bbox.yMinimum()},{bbox.yMaximum()}"
+        )
+
+        self._combine_viewsheds(
+            raster_paths, feature_key, projwin, work_dir, multiplied_path
+        )
+        mask_layer = self._vector_mask_from_feature(feat, feature_key)
+        binary, meta = self._clip_viewshed_to_binary_array(
+            multiplied_path, mask_layer
+        )
+        return {
+            "binary": binary,
+            "meta": meta,
+            "digest": _binary_visibility_digest(binary, meta),
+            "layer_name": _viewshed_layer_names(display_towers, feature_key)[0],
+            "file_stem": file_stem,
+        }
+
+    def _finalize_viewshed_pass_results(
+        self,
+        group_name,
+        output_dir,
+        pending_records,
+        ordered_ts_keys,
+        merge_timestamp_ranges,
+        skip_empty_combined,
+        ts_combined_stats,
+    ):
+        """
+        Dedupe (#1), merge adjacent timestamp ranges (#3), write compressed TIFs (#4).
+        """
+        registry = _ViewshedPatternRegistry(output_dir)
+        created_count = 0
+        range_layers = defaultdict(list)
+
+        if merge_timestamp_ranges:
+            ranged = _merge_global_timestamp_ranges(pending_records, ordered_ts_keys)
+        else:
+            ranged = []
+            for rec in sorted(
+                pending_records, key=lambda item: _timestamp_sort_key(item["ts_key"])
+            ):
+                item = dict(rec)
+                item["start_key"] = rec["ts_key"]
+                item["end_key"] = rec["ts_key"]
+                item["range_key"] = rec["ts_key"]
+                ranged.append(item)
+
+        for item in ranged:
+            if skip_empty_combined and not item["binary"].any():
+                ts_combined_stats[item["range_key"]]["empty"] += 1
+                continue
+
+            canonical_path = registry.get_or_write(
+                item["digest"], item["binary"], item["meta"]
+            )
+            range_layers[item["range_key"]].append(
+                {
+                    "layer_name": item["layer_name"],
+                    "path": canonical_path,
+                    "file_stem": item["file_stem"],
+                }
+            )
+
+        if range_layers:
+            self._prepare_timestamp_subgroups(group_name, range_layers.keys())
+
+        for range_key in sorted(range_layers.keys(), key=_legend_subgroup_sort_key):
+            subgroup = self._ensure_subgroup(group_name, range_key)
+            for layer_info in range_layers[range_key]:
+                raster_layer = QgsRasterLayer(
+                    layer_info["path"], layer_info["layer_name"], "gdal"
+                )
+                if not raster_layer.isValid():
+                    raise RuntimeError(
+                        f"Failed to load clipped viewshed: {layer_info['path']}"
+                    )
+                QgsProject.instance().addMapLayer(raster_layer, False)
+                subgroup.addLayer(raster_layer)
+                created_count += 1
+                if skip_empty_combined:
+                    ts_combined_stats[range_key]["visible"] += 1
+                self.log(
+                    f"{layer_info['layer_name']}: reused pattern {layer_info['path']} "
+                    f"under {group_name}/{range_key}"
+                )
+
+        unique_patterns = len(registry._paths)
+        if unique_patterns and len(pending_records) > unique_patterns:
+            self.log(
+                f"{group_name}: stored {unique_patterns} unique compressed pattern(s) "
+                f"for {len(pending_records)} timestamp feature(s)."
+            )
+        return created_count
+
     def _run_viewshed_analysis_pass(
         self,
         polygon_layer,
@@ -731,23 +1036,25 @@ class TAArcViewshedEngine:
         """
         features = list(polygon_layer.getFeatures())
         total = len(features) or 1
-        created_count = 0
         skip_empty_combined = mode == "cascade"
+        merge_timestamp_ranges = True
         ts_combined_stats = defaultdict(lambda: {"visible": 0, "empty": 0})
         work_dir = os.path.join(output_dir, work_subdir)
         os.makedirs(work_dir, exist_ok=True)
 
-        ts_keys = {
-            _timestamp_subgroup_key(self._timestamp_from_polygon_feature(feat))
-            for feat in features
-        }
-        ts_keys.discard("")
-        if not skip_empty_combined:
-            self._prepare_timestamp_subgroups(group_name, ts_keys)
+        ordered_ts_keys = sorted(
+            {
+                _timestamp_subgroup_key(self._timestamp_from_polygon_feature(feat))
+                for feat in features
+            }
+            - {""},
+            key=_timestamp_sort_key,
+        )
 
+        pending_records = []
         for idx, feat in enumerate(features):
             if cancel_fn and cancel_fn():
-                return created_count
+                break
 
             if progress_callback:
                 progress_callback(int(100 * idx / total))
@@ -759,11 +1066,6 @@ class TAArcViewshedEngine:
             feature_key = self._feature_key(feat, mode, idx)
             ts_key = _timestamp_subgroup_key(self._timestamp_from_polygon_feature(feat))
 
-            raster_paths = [
-                self.master_viewshed_paths[t]
-                for t in towers
-                if t in self.master_viewshed_paths
-            ]
             missing = [t for t in towers if t not in self.master_viewshed_paths]
             for tower in missing:
                 self.log(
@@ -771,57 +1073,33 @@ class TAArcViewshedEngine:
                     f"missing master viewshed for {tower}",
                     Qgis.Warning,
                 )
-            if not raster_paths:
+            if missing and not any(t in self.master_viewshed_paths for t in towers):
                 continue
 
-            ts_subdir = os.path.join(output_dir, ts_key)
-            os.makedirs(ts_subdir, exist_ok=True)
-
-            bbox = feat.geometry().boundingBox()
-            bbox.grow(max(bbox.width(), bbox.height()) * 0.01 + 1.0)
-            projwin = (
-                f"{bbox.xMinimum()},{bbox.xMaximum()},"
-                f"{bbox.yMinimum()},{bbox.yMaximum()}"
-            )
-            layer_name, file_stem = _viewshed_layer_names(display_towers, feature_key)
-            multiplied_path = os.path.join(work_dir, f"{file_stem}_multiplied.tif")
-            clipped_path = os.path.join(ts_subdir, f"{file_stem}.tif")
-
             try:
-                self._combine_viewsheds(
-                    raster_paths, feature_key, projwin, work_dir, multiplied_path
+                computed = self._compute_clipped_viewshed_binary(
+                    feat, mode, feature_key, towers, display_towers, work_dir
                 )
-                mask_layer = self._vector_mask_from_feature(feat, feature_key)
-                self._clip_viewshed_to_mask(
-                    multiplied_path, mask_layer, clipped_path
-                )
+                if computed is None:
+                    continue
 
-                if skip_empty_combined and not _raster_has_visible_cells(clipped_path):
+                if skip_empty_combined and not computed["binary"].any():
                     ts_combined_stats[ts_key]["empty"] += 1
-                    try:
-                        os.remove(clipped_path)
-                    except OSError:
-                        pass
                     self.log(
-                        f"{layer_name}: no visible cells in combined viewshed; "
-                        f"skipped layer ({group_name}/{ts_key})."
+                        f"{computed['layer_name']}: no visible cells in combined viewshed; "
+                        f"skipped ({group_name}/{ts_key})."
                     )
                     continue
 
-                subgroup = self._ensure_subgroup(group_name, ts_key)
-                raster_layer = QgsRasterLayer(clipped_path, layer_name, "gdal")
-                if not raster_layer.isValid():
-                    raise RuntimeError(
-                        f"Failed to load clipped viewshed: {clipped_path}"
-                    )
-                QgsProject.instance().addMapLayer(raster_layer, False)
-                subgroup.addLayer(raster_layer)
-                created_count += 1
-                if skip_empty_combined:
-                    ts_combined_stats[ts_key]["visible"] += 1
-                self.log(
-                    f"{layer_name}: saved to {clipped_path} and added under "
-                    f"{group_name}/{ts_key}"
+                pending_records.append(
+                    {
+                        "ts_key": ts_key,
+                        "layer_name": computed["layer_name"],
+                        "file_stem": computed["file_stem"],
+                        "binary": computed["binary"],
+                        "meta": computed["meta"],
+                        "digest": computed["digest"],
+                    }
                 )
             except Exception as exc:
                 self.log(
@@ -829,6 +1107,16 @@ class TAArcViewshedEngine:
                     Qgis.Warning,
                 )
                 self.log(traceback.format_exc(), Qgis.Warning)
+
+        created_count = self._finalize_viewshed_pass_results(
+            group_name,
+            output_dir,
+            pending_records,
+            ordered_ts_keys,
+            merge_timestamp_ranges,
+            skip_empty_combined,
+            ts_combined_stats,
+        )
 
         if skip_empty_combined:
             self._ensure_empty_combined_subgroups(group_name, ts_combined_stats)
@@ -1347,6 +1635,14 @@ class TAArcViewshedEngine:
                 )
                 continue
 
+            try:
+                _compress_viewshed_file_in_place(viewshed_path)
+            except Exception as exc:
+                self.log(
+                    f"Could not compress master viewshed for '{tower}': {exc}",
+                    Qgis.Warning,
+                )
+
             self.master_viewshed_paths[tower] = viewshed_path
             self._add_raster_to_project(
                 viewshed_path,
@@ -1730,10 +2026,10 @@ class TAArcViewshedEngine:
             raise RuntimeError(f"Extent clip failed: {input_path}")
 
     def _normalize_to_binary(self, input_path, output_path):
-        """Convert any viewshed raster to Float32 with values 0.0 or 1.0."""
+        """Convert any viewshed raster to compressed Byte 0/1 GeoTIFF."""
         arr, meta = _read_raster_band(input_path)
         binary = _array_to_binary(arr, meta["nodata"])
-        _write_float32_raster(output_path, binary, meta, nodata=RASTER_NODATA)
+        _write_binary_viewshed_raster(output_path, binary, meta)
         if not os.path.isfile(output_path):
             raise RuntimeError(f"Binary normalization failed: {input_path}")
 
@@ -1761,7 +2057,38 @@ class TAArcViewshedEngine:
                 )
             combined = combined * layer_arr
 
-        _write_float32_raster(output_path, combined, meta, nodata=RASTER_NODATA)
+        _write_binary_viewshed_raster(output_path, combined, meta)
+
+    def _clip_viewshed_to_binary_array(self, input_path, mask_layer):
+        """Clip a viewshed raster to a polygon mask; return UInt8 array and georef meta."""
+        clipped_temp = f"{input_path}.clip.tif"
+        self._run_processing(
+            "gdal:cliprasterbymasklayer",
+            {
+                "INPUT": input_path,
+                "MASK": mask_layer,
+                "SOURCE_CRS": CRS_HK1980,
+                "TARGET_CRS": CRS_HK1980,
+                "NODATA": -9999,
+                "ALPHA_BAND": False,
+                "CROP_TO_CUTLINE": True,
+                "KEEP_RESOLUTION": True,
+                "OPTIONS": "",
+                "DATA_TYPE": 5,  # Float32 intermediate for GDAL clip
+                "OUTPUT": clipped_temp,
+            },
+        )
+
+        if not os.path.isfile(clipped_temp):
+            raise RuntimeError(f"Clip did not create output: {clipped_temp}")
+
+        arr, meta = _read_raster_band(clipped_temp)
+        binary = _array_to_binary(arr, meta["nodata"])
+        try:
+            os.remove(clipped_temp)
+        except OSError:
+            pass
+        return binary, meta
 
     def _clip_viewshed_to_mask(self, input_path, mask_layer, output_path):
         clipped_temp = f"{output_path}.clip.tif"
