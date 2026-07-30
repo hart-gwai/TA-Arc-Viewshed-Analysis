@@ -1228,9 +1228,7 @@ class TAArcViewshedEngine:
                 if val is not None:
                     try:
                         candidate = float(val)
-                        # DEM ground elevation is often sampled here; keep default
-                        # observer height above terrain unless a realistic AGL value exists.
-                        if 0 < candidate < 200:
+                        if candidate > 0:
                             observer_height = candidate
                     except (TypeError, ValueError):
                         pass
