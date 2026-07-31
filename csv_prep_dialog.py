@@ -455,40 +455,19 @@ class CsvPrepDialog(QDialog):
                 fixed_max_r=fixed_max_r,
             )
 
-            sites_layer = None
-            if self.viewshed_engine is not None:
-                sites_layer = self.viewshed_engine.extract_unique_sites(
-                    ping_layer,
-                    dem_layer=self.dem_layer,
-                    suffix=suffix,
-                )
-            
             from .csv_prep_engine import _prepared_ping_output_path
 
             ping_count = ping_layer.featureCount()
-            sites_count = sites_layer.featureCount() if sites_layer else 0
             self._log(
-                f"Prepare Cell Site Data complete: {ping_count} ping(s), "
-                f"{sites_count} unique site(s)."
+                f"Prepare Cell Site Data complete: {ping_count} ping(s)."
             )
 
-            if sites_layer is not None:
-                QMessageBox.information(
-                    self,
-                    "Prepare Cell Site Data Complete",
-                    f"Created '{PREPARED_LAYER_NAME}{suffix}' ({ping_count} ping feature(s)) and "
-                    f"'{LAYER_UNIQUE_SITES}' ({sites_count} tower(s)).\n\n"
-                    f"Saved next to the project file:\n"
-                    f"  {_prepared_ping_output_path(suffix)}\n"
-                    f"  {self.viewshed_engine._unique_sites_output_path()}",
-                )
-            else:
-                QMessageBox.information(
-                    self,
-                    "Prepare Cell Site Data Complete",
-                    f"Created '{PREPARED_LAYER_NAME}{suffix}' with {ping_count} feature(s).\n\n"
-                    f"Saved to:\n{_prepared_ping_output_path(suffix)}",
-                )
+            QMessageBox.information(
+                self,
+                "Prepare Cell Site Data Complete",
+                f"Created '{PREPARED_LAYER_NAME}{suffix}' with {ping_count} feature(s).\n\n"
+                f"Saved to scenario folder:\n{_prepared_ping_output_path(suffix)}",
+            )
             self.accept()
 
         except Exception as exc:

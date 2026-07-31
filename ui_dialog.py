@@ -98,6 +98,9 @@ class TAArcViewshedDialog(QDialog):
         dem_row.addWidget(self.dem_layer_combo, stretch=1)
         input_layout.addLayout(dem_row)
 
+        self.progress_label = QLabel("")
+        input_layout.addWidget(self.progress_label)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -110,8 +113,8 @@ class TAArcViewshedDialog(QDialog):
         step1_layout = QVBoxLayout(step1_group)
         step1_layout.addWidget(
             QLabel(
-                f"Import a CSV, map columns, and create '{PREPARED_LAYER_NAME}' plus "
-                f"'{LAYER_UNIQUE_SITES}' (EPSG:2326). Both layers are saved next to the project file."
+                f"Import a CSV, map columns, and create '{PREPARED_LAYER_NAME}' (EPSG:4326). "
+                f"This layer is saved to a scenario folder next to the project file."
             )
         )
         self.btn_step1 = QPushButton(STEP_PREPARE)
@@ -119,48 +122,27 @@ class TAArcViewshedDialog(QDialog):
         step1_layout.addWidget(self.btn_step1)
         layout.addWidget(step1_group)
 
-        step2_group = QGroupBox("Step 2 — Generate Master Viewsheds")
+        step2_group = QGroupBox("Step 2 — Run Full Analysis")
         step2_layout = QVBoxLayout(step2_group)
         step2_layout.addWidget(
             QLabel(
-                "Create 360° donut viewsheds (RADIUS_IN = Min_Radius, RADIUS_OBS = Max_Radius) "
-                f"and save to '{GROUP_MASTER_VIEWSHEDS}' next to the project file."
-            )
-        )
-        
-        from qgis.PyQt.QtWidgets import QFormLayout
-        step2_form = QFormLayout()
-        self.combo_step2_sites = QgsMapLayerComboBox()
-        self.combo_step2_sites.setFilters(QgsMapLayerProxyModel.PointLayer)
-        step2_form.addRow("Target Unique Sites:", self.combo_step2_sites)
-        step2_layout.addLayout(step2_form)
-
-        self.btn_step2 = QPushButton("Generate Master Viewsheds")
-        self.btn_step2.clicked.connect(self._run_step2)
-        step2_layout.addWidget(self.btn_step2)
-        layout.addWidget(step2_group)
-
-        step3_group = QGroupBox("Step 3 — Run Analysis")
-        step3_layout = QVBoxLayout(step3_group)
-        step3_layout.addWidget(
-            QLabel(
-                "Build TA polygons, apply cascade overlap logic, and run viewshed analysis. "
-                "The analysis dynamically tracks the scenario suffix from the selected Target Ping Layer."
+                "Extract unique cell sites, generate master viewsheds, build TA polygons, "
+                "apply cascade overlap logic, and run viewshed analysis."
             )
         )
         
         # Add Input layer selection
         from qgis.PyQt.QtWidgets import QCheckBox, QDoubleSpinBox, QFormLayout, QWidget
-        step3_form = QFormLayout()
-        self.combo_step3_pings = QgsMapLayerComboBox()
-        self.combo_step3_pings.setFilters(QgsMapLayerProxyModel.PointLayer)
-        step3_form.addRow("Target Ping Layer:", self.combo_step3_pings)
-        step3_layout.addLayout(step3_form)
+        step2_form = QFormLayout()
+        self.combo_step2_pings = QgsMapLayerComboBox()
+        self.combo_step2_pings.setFilters(QgsMapLayerProxyModel.PointLayer)
+        step2_form.addRow("Target Ping Layer:", self.combo_step2_pings)
+        step2_layout.addLayout(step2_form)
 
         # --- Rolling Window Settings ---
         self.check_rolling_window = QCheckBox("Apply rolling time window across sequential timestamps")
         self.check_rolling_window.toggled.connect(self._on_rolling_toggled)
-        step3_layout.addWidget(self.check_rolling_window)
+        step2_layout.addWidget(self.check_rolling_window)
 
         self.rolling_options = QWidget()
         rolling_form = QFormLayout(self.rolling_options)
@@ -177,13 +159,13 @@ class TAArcViewshedDialog(QDialog):
         self.spin_step_size.setValue(1)
         self.spin_step_size.setSuffix(" timestamp(s) forward")
         rolling_form.addRow("Step Size:", self.spin_step_size)
-        step3_layout.addWidget(self.rolling_options)
+        step2_layout.addWidget(self.rolling_options)
         self.rolling_options.setVisible(False)
 
-        self.btn_step3 = QPushButton("Run Full Analysis (Arcs + Viewsheds)")
-        self.btn_step3.clicked.connect(self._run_step3)
-        step3_layout.addWidget(self.btn_step3)
-        layout.addWidget(step3_group)
+        self.btn_step2 = QPushButton("Run Full Analysis")
+        self.btn_step2.clicked.connect(self._run_step2)
+        step2_layout.addWidget(self.btn_step2)
+        layout.addWidget(step2_group)
 
         layout.addStretch()
 
@@ -194,7 +176,7 @@ class TAArcViewshedDialog(QDialog):
         self.rolling_options.setVisible(checked)
 
     def _set_busy(self, busy):
-        for btn in (self.btn_step1, self.btn_step2, self.btn_step3):
+        for btn in (self.btn_step1, self.btn_step2):
             btn.setEnabled(not busy)
         self.dem_layer_combo.setEnabled(not busy)
 
@@ -347,35 +329,17 @@ class TAArcViewshedDialog(QDialog):
         self._set_busy(False)
 
     @pyqtSlot()
-    def _run_step3(self):
-        ping_layer = self.combo_step3_pings.currentLayer()
+    def _run_step2(self):
+        ping_layer = self.combo_step2_pings.currentLayer()
         if ping_layer is None:
             QMessageBox.warning(self, "Missing Input", "Please select a Target Ping Layer.")
             return
-
-        suffix = ping_layer.name().replace(PREPARED_LAYER_NAME, "")
-
-        sites_layer_name = f"{LAYER_UNIQUE_SITES}{suffix}"
-        sites_layer = self.engine.find_layer_by_name(sites_layer_name)
-        if sites_layer is None:
-            # Fallback to unsuffixed layer if old run
-            sites_layer = self.engine.find_layer_by_name(LAYER_UNIQUE_SITES)
-            if sites_layer is None:
-                QMessageBox.warning(self, "Missing Input", f"'{sites_layer_name}' not found. Please run Step 1.")
-                return
 
         dem_layer = self._validate_dem()
         if dem_layer is None:
             return
 
-        if not self.engine.resolve_master_viewshed_paths(suffix=suffix):
-            QMessageBox.warning(
-                self,
-                "Prerequisite",
-                f"Run Step 2 first to generate master viewsheds in "
-                f"'{GROUP_MASTER_VIEWSHEDS}{suffix}'.",
-            )
-            return
+        suffix = ping_layer.name().replace(PREPARED_LAYER_NAME, "")
 
         if self._task_is_active(self._raster_task):
             QMessageBox.information(self, "Busy", "Analysis is already running.")
@@ -392,7 +356,29 @@ class TAArcViewshedDialog(QDialog):
             }
 
         try:
+            self.progress_label.setText("Extracting Unique Cell Sites...")
+            QgsApplication.processEvents()
+            
+            sites_layer = self.engine.extract_unique_sites(
+                ping_layer,
+                dem_layer=dem_layer,
+                suffix=suffix,
+            )
+
+            self.progress_label.setText("Generating Master Viewsheds...")
+            QgsApplication.processEvents()
+            
+            self.engine.generate_master_viewsheds(
+                sites_layer,
+                dem_layer,
+                progress_callback=self._on_progress,
+                suffix=suffix
+            )
+
+            self.progress_label.setText("Building Cascade Polygons...")
+            QgsApplication.processEvents()
             self._log(f"Starting cascade polygons generation with suffix '{suffix}'...")
+            
             self.engine.run_cascade_polygons(
                 ping_layer,
                 sites_layer,
@@ -416,6 +402,8 @@ class TAArcViewshedDialog(QDialog):
 
             if ta_polygons_layer and cascade_layer:
                 self.progress_bar.setValue(0)
+                self.progress_label.setText("Multiplying and Cropping Viewsheds...")
+                QgsApplication.processEvents()
                 self._log("Cascade complete. Starting viewshed analysis...")
                 
                 success = self.engine.multiply_and_crop_rasters(
@@ -432,11 +420,24 @@ class TAArcViewshedDialog(QDialog):
                         "Analysis Complete",
                         f"Generated Arc Polygons and clipped Viewsheds successfully using suffix '{suffix}'."
                     )
-            
+                else:
+                    QMessageBox.critical(
+                        self,
+                        "Analysis Failed",
+                        "Raster combination failed. Check message log.",
+                    )
+            else:
+                QMessageBox.critical(
+                    self,
+                    "Analysis Failed",
+                    "Could not find output polygon layers. Check message log.",
+                )
+
         except Exception as exc:
             self._log(str(exc), Qgis.Critical)
             QMessageBox.critical(self, "Analysis Failed", str(exc))
         finally:
+            self.progress_label.setText("")
             self._set_busy(False)
             self.progress_bar.setValue(100)
 
