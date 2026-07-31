@@ -1837,15 +1837,15 @@ class TAArcViewshedEngine:
                     new_arc["timestamp"] = range_label
                     rolled_arcs.append(new_arc)
                 else:
-                    # Dissolve (Union) all arcs for this tower in this time window
-                    combined_geom = QgsGeometry()
+                    # Dissolve (Union) all arcs for this tower in this time window using optimized unaryUnion
+                    unique_geometries = {}
                     for arc in tower_arcs:
                         geom = arc["geometry"]
-                        if combined_geom.isEmpty():
-                            combined_geom = QgsGeometry(geom)
-                        else:
-                            combined_geom = combined_geom.combine(geom)
-
+                        wkt = geom.asWkt()
+                        if wkt not in unique_geometries:
+                            unique_geometries[wkt] = geom
+                    
+                    combined_geom = QgsGeometry.unaryUnion(list(unique_geometries.values()))
                     combined_geom = _repair_geometry(combined_geom)
 
                     new_arc = dict(tower_arcs[0])
