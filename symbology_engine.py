@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Apply consistent viewshed raster symbology across plugin layer groups."""
 
+import re
 from collections import defaultdict
 from datetime import datetime
 
@@ -54,14 +55,24 @@ def _log(message, level=Qgis.Info):
 
 
 def _parse_timestamp_label(label):
-    """Parse a legend subgroup name back into a datetime when possible."""
+    """Parse a legend subgroup name back into a datetime when possible.
+    Extracts the first valid timestamp from strings like '2026-03-13 15_38_00-16_03_00'.
+    """
     text = str(label or "").strip()
     if not text:
         return None
-    normalized = text.replace("_", ":")
+    
+    # Try to find a date or date-time pattern.
+    # Matches 'YYYY-MM-DD', 'YYYY-MM-DD HH_MM', or 'YYYY-MM-DD HH_MM_SS'
+    match = re.search(r"(\d{4}-\d{2}-\d{2}(?: \d{2}_\d{2}(?:_\d{2})?)?)", text)
+    if not match:
+        return None
+        
+    date_str = match.group(1).replace("_", ":")
+    
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
-            return datetime.strptime(normalized, fmt)
+            return datetime.strptime(date_str, fmt)
         except ValueError:
             continue
     return None
