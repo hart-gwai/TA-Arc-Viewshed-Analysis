@@ -164,6 +164,15 @@ def _write_float32_raster(path, arr, meta, nodata=RASTER_NODATA):
     out_ds = driver.Create(
         path, cols, rows, 1, gdal.GDT_Float32, options=["COMPRESS=LZW"]
     )
+    if out_ds is None:
+        import time, os
+        base, ext = os.path.splitext(path)
+        path = f"{base}_{int(time.time())}{ext}"
+        out_ds = driver.Create(
+            path, cols, rows, 1, gdal.GDT_Float32, options=["COMPRESS=LZW"]
+        )
+        if out_ds is None:
+            raise RuntimeError(f"Could not create raster file: {path}")
     out_ds.SetGeoTransform(meta["geotransform"])
     out_ds.SetProjection(meta["projection"])
     out_band = out_ds.GetRasterBand(1)
@@ -189,12 +198,27 @@ def _write_binary_viewshed_raster(path, arr, meta):
         gdal.GDT_Byte,
         options=["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES"],
     )
+    if out_ds is None:
+        import time, os
+        base, ext = os.path.splitext(path)
+        path = f"{base}_{int(time.time())}{ext}"
+        out_ds = driver.Create(
+            path,
+            cols,
+            rows,
+            1,
+            gdal.GDT_Byte,
+            options=["COMPRESS=LZW", "PREDICTOR=2", "TILED=YES"],
+        )
+        if out_ds is None:
+            raise RuntimeError(f"Could not create raster file: {path}")
     out_ds.SetGeoTransform(meta["geotransform"])
     out_ds.SetProjection(meta["projection"])
     out_band = out_ds.GetRasterBand(1)
     out_band.WriteArray(data)
     out_band.FlushCache()
     out_ds = None
+    return path
 
 
 def _array_to_binary(arr, nodata):
@@ -388,7 +412,7 @@ class _ViewshedPatternRegistry:
 
         path = os.path.join(self.pattern_dir, f"{digest}.tif")
         if not os.path.isfile(path):
-            _write_binary_viewshed_raster(path, binary, meta)
+            path = _write_binary_viewshed_raster(path, binary, meta)
         self._paths[digest] = path
         return path
 
@@ -407,7 +431,7 @@ def _compress_viewshed_file_in_place(path):
     arr, meta = _read_raster_band(path)
     binary = _array_to_binary(arr, meta["nodata"])
     temp_path = f"{path}.compressing.tif"
-    _write_binary_viewshed_raster(temp_path, binary, meta)
+    temp_path = _write_binary_viewshed_raster(temp_path, binary, meta)
     os.replace(temp_path, path)
 
 
@@ -526,7 +550,12 @@ def _write_cascade_pockets_to_gpkg(pockets, output_path, layer_name):
     from osgeo import ogr, osr
 
     if os.path.isfile(output_path):
-        os.remove(output_path)
+        try:
+            os.remove(output_path)
+        except OSError:
+            import time
+            base, ext = os.path.splitext(output_path)
+            output_path = f"{base}_{int(time.time())}{ext}"
 
     driver = ogr.GetDriverByName("GPKG")
     if driver is None:
@@ -589,7 +618,7 @@ def _write_cascade_pockets_to_gpkg(pockets, output_path, layer_name):
             written += 1
 
     dataset = None
-    return written, skipped
+    return written, skipped, output_path
 
 
 def _fallback_isolated_pockets(arcs):
@@ -675,9 +704,9 @@ class TAArcViewshedEngine:
             )
         return project_dir
 
-    def _unique_sites_output_path(self):
+    def _unique_sites_output_path(self, suffix=""):
         """GeoPackage next to the project file for Step 1 unique sites."""
-        return os.path.join(self._project_output_dir(), f"{LAYER_UNIQUE_SITES}.gpkg")
+        return os.path.join(self._project_output_dir(), f"{LAYER_UNIQUE_SITES}{suffix}.gpkg")
 
     def _remove_output_files(self, *paths):
         """Delete prior Step 2 outputs so GDAL/OGR can recreate them."""
@@ -740,30 +769,30 @@ class TAArcViewshedEngine:
             raise RuntimeError(f"Failed to load processing output: {output}")
         raise RuntimeError(f"Unexpected processing output type: {type(output)!r}")
 
-    def _master_viewshed_output_dir(self):
+    def _master_viewshed_output_dir(self, suffix=""):
         """Folder next to the saved QGIS project file for Step 2 rasters."""
-        output_dir = os.path.join(self._project_output_dir(), GROUP_MASTER_VIEWSHEDS)
+        output_dir = os.path.join(self._project_output_dir(), f"{GROUP_MASTER_VIEWSHEDS}{suffix}")
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
 
-    def _ta_polygons_output_path(self):
+    def _ta_polygons_output_path(self, suffix=""):
         """GeoPackage for original arc sectors before cascade (Step 3)."""
-        return os.path.join(self._project_output_dir(), f"{LAYER_TA_POLYGONS}.gpkg")
+        return os.path.join(self._project_output_dir(), f"{LAYER_TA_POLYGONS}{suffix}.gpkg")
 
-    def _cascade_polygons_output_path(self):
+    def _cascade_polygons_output_path(self, suffix=""):
         """GeoPackage next to the project file for Step 3 cascade pockets."""
-        return os.path.join(self._project_output_dir(), f"{LAYER_CASCADE}.gpkg")
+        return os.path.join(self._project_output_dir(), f"{LAYER_CASCADE}{suffix}.gpkg")
 
-    def _viewshed_with_ta_output_dir(self):
+    def _viewshed_with_ta_output_dir(self, suffix=""):
         """Folder next to the project file for Step 4 TA polygon viewsheds."""
-        output_dir = os.path.join(self._project_output_dir(), GROUP_VIEWSHED_WITH_TA)
+        output_dir = os.path.join(self._project_output_dir(), f"{GROUP_VIEWSHED_WITH_TA}{suffix}")
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
 
-    def _combined_viewshed_output_dir(self):
+    def _combined_viewshed_output_dir(self, suffix=""):
         """Folder next to the project file for Step 4 combined viewsheds."""
         output_dir = os.path.join(
-            self._project_output_dir(), GROUP_COMBINED_VIEWSHED
+            self._project_output_dir(), f"{GROUP_COMBINED_VIEWSHED}{suffix}"
         )
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
@@ -781,9 +810,12 @@ class TAArcViewshedEngine:
             except OSError as exc:
                 self.log(
                     f"Could not remove existing GeoPackage before save "
-                    f"({output_path}): {exc}",
+                    f"({output_path}): {exc}. Trying alternate name.",
                     Qgis.Warning,
                 )
+                import time
+                base, ext = os.path.splitext(output_path)
+                output_path = f"{base}_{int(time.time())}{ext}"
 
         processing.run(
             "native:savefeatures",
@@ -804,7 +836,7 @@ class TAArcViewshedEngine:
                 f"{expected} feature(s) in memory but loaded {actual} from disk. "
                 "Some cascade geometries may be invalid — check the message log."
             )
-        return saved_layer
+        return saved_layer, output_path
 
     def _ensure_group(self, group_name):
         root = QgsProject.instance().layerTreeRoot()
@@ -1263,7 +1295,7 @@ class TAArcViewshedEngine:
             QgsProject.instance().addMapLayer(layer, True)
         return layer
 
-    def resolve_master_viewshed_paths(self):
+    def resolve_master_viewshed_paths(self, suffix=""):
         """
         Build Cell_Site -> viewshed file path mapping from the current project.
 
@@ -1275,7 +1307,8 @@ class TAArcViewshedEngine:
 
         resolved = {}
         root = QgsProject.instance().layerTreeRoot()
-        for group_name in (GROUP_MASTER_VIEWSHEDS,) + LEGACY_MASTER_VIEWSHED_GROUPS:
+        group_names = (f"{GROUP_MASTER_VIEWSHEDS}{suffix}", GROUP_MASTER_VIEWSHEDS) + LEGACY_MASTER_VIEWSHED_GROUPS
+        for group_name in group_names:
             group = root.findGroup(group_name)
             if group is None:
                 continue
@@ -1470,7 +1503,7 @@ class TAArcViewshedEngine:
         }
 
     # ----------------------------------------------------------- Step 1
-    def extract_unique_sites(self, ping_layer, dem_layer=None, progress_callback=None):
+    def extract_unique_sites(self, ping_layer, dem_layer=None, progress_callback=None, suffix=""):
         """
         Parse ping CSV layer, transform tower coordinates to EPSG:2326, and
         aggregate global Min_Radius / Max_Radius per unique Cell_Site.
@@ -1534,12 +1567,13 @@ class TAArcViewshedEngine:
         if not aggregates:
             raise ValueError("No valid ping features found for unique site extraction.")
 
-        existing = self.find_layer_by_name(LAYER_UNIQUE_SITES)
+        layer_name = f"{LAYER_UNIQUE_SITES}{suffix}"
+        existing = self.find_layer_by_name(layer_name)
         if existing:
             QgsProject.instance().removeMapLayer(existing.id())
 
         layer = QgsVectorLayer(
-            f"Point?crs={CRS_HK1980.authid()}", LAYER_UNIQUE_SITES, "memory"
+            f"Point?crs={CRS_HK1980.authid()}", layer_name, "memory"
         )
         provider = layer.dataProvider()
         provider.addAttributes(
@@ -1570,8 +1604,8 @@ class TAArcViewshedEngine:
         provider.addFeatures(features)
         layer.updateExtents()
 
-        output_path = self._unique_sites_output_path()
-        saved_layer = self._save_vector_to_gpkg(layer, output_path, LAYER_UNIQUE_SITES)
+        output_path = self._unique_sites_output_path(suffix)
+        saved_layer, output_path = self._save_vector_to_gpkg(layer, output_path, layer_name)
         self._add_vector_to_project(saved_layer)
         self.log(f"Saved unique sites to: {output_path}")
 
@@ -1585,14 +1619,14 @@ class TAArcViewshedEngine:
         return saved_layer
 
     # ----------------------------------------------------------- Step 2
-    def generate_master_viewsheds(self, sites_layer, dem_layer, progress_callback=None, cancel_fn=None):
+    def generate_master_viewsheds(self, sites_layer, dem_layer, progress_callback=None, cancel_fn=None, suffix=""):
         """
         Generate one 360° donut viewshed per tower using visibility algorithms.
         RADIUS_IN = min_radius (inner dead-zone), RADIUS_OBS = max_radius.
         """
         self.master_viewshed_paths.clear()
         self.skipped_master_viewsheds = []
-        output_dir = self._master_viewshed_output_dir()
+        output_dir = self._master_viewshed_output_dir(suffix)
         self.master_viewshed_output_dir = output_dir
         self.log(f"Writing master viewsheds to: {output_dir}")
         _require_processing_algorithm("visibility:createviewpoints")
@@ -1758,7 +1792,7 @@ class TAArcViewshedEngine:
             self._add_raster_to_project(
                 viewshed_path,
                 f"Viewshed_{tower}",
-                GROUP_MASTER_VIEWSHEDS,
+                f"{GROUP_MASTER_VIEWSHEDS}{suffix}",
             )
             self.log(
                 f"Master viewshed for {tower}: RADIUS_IN={min_radius}, RADIUS_OBS={max_radius}"
@@ -1784,8 +1818,9 @@ class TAArcViewshedEngine:
                 f"skipped {len(self.skipped_master_viewsheds)} tower(s).",
                 Qgis.Warning,
             )
-        self._hide_viewshed_group(GROUP_MASTER_VIEWSHEDS)
-        self._apply_default_multicolour_symbology([GROUP_MASTER_VIEWSHEDS])
+        # Also hide the new group
+        self._hide_viewshed_group(f"{GROUP_MASTER_VIEWSHEDS}{suffix}")
+        self._apply_default_multicolour_symbology([f"{GROUP_MASTER_VIEWSHEDS}{suffix}"])
         return True
 
     def _apply_rolling_window_to_arcs(self, arcs, rolling_window):
@@ -1862,7 +1897,7 @@ class TAArcViewshedEngine:
         return rolled_arcs
 
     # ----------------------------------------------------------- Step 3
-    def run_cascade_polygons(self, ping_layer, sites_layer, rolling_window=None, progress_callback=None):
+    def run_cascade_polygons(self, ping_layer, sites_layer, rolling_window=None, progress_callback=None, suffix=""):
         """
         Translate CSV arcs to curved polygons and apply 3-tier cascade logic:
 
@@ -1977,22 +2012,25 @@ class TAArcViewshedEngine:
         if progress_callback:
             progress_callback(70)
 
-        for name in (LAYER_TA_POLYGONS, LAYER_CASCADE, LEGACY_LAYER_CASCADE, "Cascade_Polygons"):
+        ta_layer_name = f"{LAYER_TA_POLYGONS}{suffix}"
+        cascade_layer_name = f"{LAYER_CASCADE}{suffix}"
+
+        for name in (ta_layer_name, cascade_layer_name, LAYER_TA_POLYGONS, LAYER_CASCADE, LEGACY_LAYER_CASCADE, "Cascade_Polygons"):
             existing = self.find_layer_by_name(name)
             if existing:
                 QgsProject.instance().removeMapLayer(existing.id())
 
-        original_layer = self._build_original_ta_polygons_layer(arcs)
-        original_path = self._ta_polygons_output_path()
-        saved_original = self._save_vector_to_gpkg(
-            original_layer, original_path, LAYER_TA_POLYGONS
+        original_layer = self._build_original_ta_polygons_layer(arcs, ta_layer_name)
+        original_path = self._ta_polygons_output_path(suffix)
+        saved_original, original_path = self._save_vector_to_gpkg(
+            original_layer, original_path, ta_layer_name
         )
         self._add_layer_at_project_root(saved_original)
         self.log(f"Saved original TA polygons to: {original_path}")
 
-        output_path = self._cascade_polygons_output_path()
-        written, skipped = _write_cascade_pockets_to_gpkg(
-            pockets, output_path, LAYER_CASCADE
+        output_path = self._cascade_polygons_output_path(suffix)
+        written, skipped, output_path = _write_cascade_pockets_to_gpkg(
+            pockets, output_path, cascade_layer_name
         )
         if skipped:
             self.log(
@@ -2001,7 +2039,7 @@ class TAArcViewshedEngine:
                 Qgis.Warning,
             )
 
-        saved_layer = QgsVectorLayer(output_path, LAYER_CASCADE, "ogr")
+        saved_layer = QgsVectorLayer(output_path, cascade_layer_name, "ogr")
         if not saved_layer.isValid():
             raise RuntimeError(f"Failed to load saved cascade layer: {output_path}")
 
@@ -2024,10 +2062,10 @@ class TAArcViewshedEngine:
         )
         return saved_layer
 
-    def _build_original_ta_polygons_layer(self, arcs):
+    def _build_original_ta_polygons_layer(self, arcs, layer_name):
         """One feature per ping arc before cascade intersection."""
         layer = QgsVectorLayer(
-            f"Polygon?crs={CRS_HK1980.authid()}", LAYER_TA_POLYGONS, "memory"
+            f"Polygon?crs={CRS_HK1980.authid()}", layer_name, "memory"
         )
         provider = layer.dataProvider()
         provider.addAttributes(
@@ -2215,7 +2253,7 @@ class TAArcViewshedEngine:
         """Convert any viewshed raster to compressed Byte 0/1 GeoTIFF."""
         arr, meta = _read_raster_band(input_path)
         binary = _array_to_binary(arr, meta["nodata"])
-        _write_binary_viewshed_raster(output_path, binary, meta)
+        output_path = _write_binary_viewshed_raster(output_path, binary, meta)
         if not os.path.isfile(output_path):
             raise RuntimeError(f"Binary normalization failed: {input_path}")
 
@@ -2243,7 +2281,7 @@ class TAArcViewshedEngine:
                 )
             combined = combined * layer_arr
 
-        _write_binary_viewshed_raster(output_path, combined, meta)
+        output_path = _write_binary_viewshed_raster(output_path, combined, meta)
 
     def _clip_viewshed_to_binary_array(self, input_path, mask_layer):
         """Clip a viewshed raster to a polygon mask; return UInt8 array and georef meta."""
@@ -2317,6 +2355,7 @@ class TAArcViewshedEngine:
         dem_layer,
         progress_callback=None,
         cancel_fn=None,
+        suffix="",
     ):
         """
         Run viewshed analysis twice:
@@ -2328,20 +2367,23 @@ class TAArcViewshedEngine:
         """
         del dem_layer  # retained for API compatibility with the dialog
 
-        self.resolve_master_viewshed_paths()
+        self.resolve_master_viewshed_paths(suffix=suffix)
         if not self.master_viewshed_paths:
             raise RuntimeError(
                 f"No master viewshed rasters found. Run Step 2 or load rasters "
                 f"from '{GROUP_MASTER_VIEWSHEDS}'."
             )
 
-        self.viewshed_with_ta_output_dir = self._viewshed_with_ta_output_dir()
-        self.combined_viewshed_output_dir = self._combined_viewshed_output_dir()
+        self.viewshed_with_ta_output_dir = self._viewshed_with_ta_output_dir(suffix)
+        self.combined_viewshed_output_dir = self._combined_viewshed_output_dir(suffix)
         self.timestamped_viewshed_output_dir = self.combined_viewshed_output_dir
 
+        ta_group_name = f"{GROUP_VIEWSHED_WITH_TA}{suffix}"
+        combined_group_name = f"{GROUP_COMBINED_VIEWSHED}{suffix}"
+
         for group_name in (
-            GROUP_VIEWSHED_WITH_TA,
-            GROUP_COMBINED_VIEWSHED,
+            ta_group_name,
+            combined_group_name,
             GROUP_TIMESTAMPED_VIEWSHEDS,
         ):
             self._clear_layer_tree_group(group_name)
@@ -2361,7 +2403,7 @@ class TAArcViewshedEngine:
 
         ta_count = self._run_viewshed_analysis_pass(
             ta_polygons_layer,
-            GROUP_VIEWSHED_WITH_TA,
+            ta_group_name,
             self.viewshed_with_ta_output_dir,
             mode="ta",
             work_subdir="_work_ta",
@@ -2373,7 +2415,7 @@ class TAArcViewshedEngine:
 
         combined_count = self._run_viewshed_analysis_pass(
             cascade_layer,
-            GROUP_COMBINED_VIEWSHED,
+            combined_group_name,
             self.combined_viewshed_output_dir,
             mode="cascade",
             work_subdir="_work_combined",
@@ -2394,13 +2436,13 @@ class TAArcViewshedEngine:
         self.last_viewshed_combined_count = combined_count
         self.log(
             f"Viewshed analysis complete: {ta_count} layer(s) in "
-            f"'{GROUP_VIEWSHED_WITH_TA}', {combined_count} layer(s) in "
-            f"'{GROUP_COMBINED_VIEWSHED}'."
+            f"'{ta_group_name}', {combined_count} layer(s) in "
+            f"'{combined_group_name}'."
         )
-        for group_name in (GROUP_VIEWSHED_WITH_TA, GROUP_COMBINED_VIEWSHED):
+        for group_name in (ta_group_name, combined_group_name):
             self._hide_viewshed_group(group_name)
         self._apply_default_multicolour_symbology(
-            [GROUP_VIEWSHED_WITH_TA, GROUP_COMBINED_VIEWSHED]
+            [ta_group_name, combined_group_name]
         )
         return True
 

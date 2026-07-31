@@ -187,7 +187,16 @@ def apply_viewshed_symbology(group_name, mode):
 
     mode: SYMBOL_MODE_MONO or SYMBOL_MODE_MULTI
     """
-    if group_name not in MANAGED_GROUPS:
+    is_managed = False
+    is_master = False
+    for managed_name in MANAGED_GROUPS:
+        if group_name.startswith(managed_name):
+            is_managed = True
+            if managed_name == GROUP_MASTER_VIEWSHEDS:
+                is_master = True
+            break
+            
+    if not is_managed:
         raise ValueError(f"Unsupported group: {group_name}")
     if mode not in (SYMBOL_MODE_MONO, SYMBOL_MODE_MULTI):
         raise ValueError(f"Unsupported symbology mode: {mode}")
@@ -201,7 +210,7 @@ def apply_viewshed_symbology(group_name, mode):
 
     styled = 0
 
-    if group_name == GROUP_MASTER_VIEWSHEDS:
+    if is_master:
         mono_color = QColor(0, 0, 255, VISIBLE_OPACITY_ALPHA)
         if mode == SYMBOL_MODE_MONO:
             for _, layer in rasters:

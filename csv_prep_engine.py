@@ -51,15 +51,15 @@ PREPARED_LAYER_NAME = "Prepared_Ping_Layer"
 DEFAULT_CRS = QgsCoordinateReferenceSystem("EPSG:4326")
 
 
-def _prepared_ping_output_path():
+def _prepared_ping_output_path(suffix=""):
     """GeoPackage next to the saved QGIS project file for Prepare Cell Site Data."""
     project_dir = QgsProject.instance().absolutePath()
     if not project_dir:
         raise RuntimeError(
             "Save the QGIS project before running Prepare Cell Site Data. "
-            f"'{PREPARED_LAYER_NAME}' is written next to the project file."
+            f"'{PREPARED_LAYER_NAME}{suffix}' is written next to the project file."
         )
-    return os.path.join(project_dir, f"{PREPARED_LAYER_NAME}.gpkg")
+    return os.path.join(project_dir, f"{PREPARED_LAYER_NAME}{suffix}.gpkg")
 
 # Standard field names written to the prepared layer (match logic_engine lookups).
 OUT_TOWER = "Cell_Site"
@@ -676,6 +676,9 @@ class CsvPrepEngine:
         dem_layer=None,
         azimuth_delta=45.0,
         time_bin_minutes=0,
+        aoi_layer=None,
+        suffix="",
+        fixed_max_r=None,
     ):
         """
         Build Prepared_Ping_Layer from *source_layer* using column *mapping*.
@@ -689,7 +692,8 @@ class CsvPrepEngine:
             raise ValueError("Source layer is invalid.")
 
         if _is_none_choice(mapping.get("min_r")) or _is_none_choice(mapping.get("max_r")):
-            raise ValueError("Min radius and Max radius columns are required.")
+            if (aoi_layer is None or not aoi_layer.isValid()) and fixed_max_r is None:
+                raise ValueError("Min radius and Max radius columns are required unless a Search Area (AOI) layer or Fixed Radius is provided.")
 
         if not use_azimuth_mode:
             if _is_none_choice(mapping.get("start_az")) or _is_none_choice(mapping.get("end_az")):
@@ -747,6 +751,24 @@ class CsvPrepEngine:
         out_features = []
         skipped_geom = 0
 
+        # --- AOI Fallback Setup ---
+        aoi_geom = None
+        aoi_vertices = []
+        point_transform = None
+        if aoi_layer and aoi_layer.isValid():
+            projected_crs = QgsCoordinateReferenceSystem("EPSG:2326")
+            aoi_transform = QgsCoordinateTransform(aoi_layer.crs(), projected_crs, QgsProject.instance())
+            geoms = []
+            for aoi_f in aoi_layer.getFeatures():
+                g = QgsGeometry(aoi_f.geometry())
+                if not g.isEmpty():
+                    g.transform(aoi_transform)
+                    geoms.append(g)
+            if geoms:
+                aoi_geom = QgsGeometry.unaryUnion(geoms)
+                aoi_vertices = [QgsPointXY(v) for v in aoi_geom.vertices()]
+            point_transform = QgsCoordinateTransform(source_layer.crs(), projected_crs, QgsProject.instance())
+
         for feat in source_layer.getFeatures():
             geom = feat.geometry()
             if geom is None or geom.isEmpty():
@@ -764,11 +786,29 @@ class CsvPrepEngine:
 
             tower_val = cell_sites_by_location[coord_key]
 
-            min_r = _safe_float(feat[mapping["min_r"]])
-            max_r = _safe_float(feat[mapping["max_r"]])
+            min_r = None
+            if not _is_none_choice(mapping.get("min_r")):
+                min_r = _safe_float(feat[mapping.get("min_r")])
+                
+            max_r = None
+            if not _is_none_choice(mapping.get("max_r")):
+                max_r = _safe_float(feat[mapping.get("max_r")])
+                
             if min_r is None or max_r is None or math.isnan(min_r) or math.isnan(max_r):
-                skipped_geom += 1
-                continue
+                if aoi_geom is not None and point_transform is not None:
+                    pt_geom = QgsGeometry(geom)
+                    pt_geom.transform(point_transform)
+                    min_r = pt_geom.distance(aoi_geom)
+                    if aoi_vertices:
+                        max_r = max([pt_geom.distance(QgsGeometry.fromPointXY(v)) for v in aoi_vertices])
+                    else:
+                        max_r = min_r + 1000
+                elif fixed_max_r is not None:
+                    min_r = 0.0
+                    max_r = float(fixed_max_r)
+                else:
+                    skipped_geom += 1
+                    continue
 
             attrs = {
                 OUT_START_AZ: feat[mapping["start_az"]] if not _is_none_choice(mapping.get("start_az")) else 0,
@@ -831,20 +871,30 @@ class CsvPrepEngine:
                 f"(CSV and/or DEM '{dem_layer.name()}')."
             )
 
-        existing = QgsProject.instance().mapLayersByName(PREPARED_LAYER_NAME)
+        layer_name = f"{PREPARED_LAYER_NAME}{suffix}"
+        
+        existing = QgsProject.instance().mapLayersByName(layer_name)
         for old in existing:
             QgsProject.instance().removeMapLayer(old.id())
 
-        output_path = _prepared_ping_output_path()
+        output_path = _prepared_ping_output_path(suffix)
+        if os.path.isfile(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                import time
+                base, ext = os.path.splitext(output_path)
+                output_path = f"{base}_{int(time.time())}{ext}"
+
         processing.run(
             "native:savefeatures",
             {
                 "INPUT": out_layer,
                 "OUTPUT": output_path,
-                "LAYER_NAME": PREPARED_LAYER_NAME,
+                "LAYER_NAME": layer_name,
             },
         )
-        saved_layer = QgsVectorLayer(output_path, PREPARED_LAYER_NAME, "ogr")
+        saved_layer = QgsVectorLayer(output_path, layer_name, "ogr")
         if not saved_layer.isValid():
             raise RuntimeError(f"Failed to load saved prepared ping layer: {output_path}")
 
