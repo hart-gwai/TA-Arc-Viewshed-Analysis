@@ -2,7 +2,7 @@
 name=Cell Site Data Analyser
 qgisMinimumVersion=3.22
 description=Sequential SAR workflow for unique cell sites, master tower viewsheds, cascade arc polygons, and bounded raster multiplication.
-version=1.9.1
+version=2.0.0
 author=SAR Operations
 email=
 
