@@ -47,7 +47,7 @@ class TAArcViewshedDialog(QDialog):
         self._viewshed_task = None
         self._raster_task = None
 
-        self.setWindowTitle("Cell Site Data Analyzer")
+        self.setWindowTitle("Cell Site Data Analyser")
         self.setMinimumWidth(520)
         self._build_ui()
 
