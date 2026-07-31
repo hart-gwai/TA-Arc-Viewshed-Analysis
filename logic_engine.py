@@ -52,8 +52,8 @@ FIELD_TIMESTAMP = ("Timestamp", "Event_Time", "DateTime", "Time", "Ping_Time", "
 FIELD_OBSERVER_H = ("observer_height", "Observer_Height", "obs_height", "height")
 
 LAYER_UNIQUE_SITES = "Unique_Cell_Sites"
-LAYER_TA_POLYGONS = "TA polygons"
-LAYER_CASCADE = "TA polygon overlapped"
+LAYER_TA_POLYGONS = "Cell Site Arcs"
+LAYER_CASCADE = "Overlapped Cell Site Arcs"
 LEGACY_LAYER_CASCADE = "TA polygons overlaped"
 GROUP_MASTER_VIEWSHEDS = "Master Viewshed"
 GROUP_VIEWSHED_WITH_TA = "Viewshed with TA"
@@ -694,6 +694,21 @@ class TAArcViewshedEngine:
                 return layer
         return None
 
+    def _scenario_output_dir(self, suffix=""):
+        """Directory named after scenario suffix, inside the project folder."""
+        project_dir = QgsProject.instance().absolutePath()
+        if not project_dir:
+            raise RuntimeError(
+                "Save the QGIS project before running this step. "
+                "Outputs are written next to the project file."
+            )
+        folder_name = suffix.strip("_ ")
+        if not folder_name:
+            folder_name = "Default_Scenario"
+        scenario_dir = os.path.join(project_dir, folder_name)
+        os.makedirs(scenario_dir, exist_ok=True)
+        return scenario_dir
+
     def _project_output_dir(self):
         """Directory containing the saved QGIS project file."""
         project_dir = QgsProject.instance().absolutePath()
@@ -704,9 +719,24 @@ class TAArcViewshedEngine:
             )
         return project_dir
 
+    def _scenario_output_dir(self, suffix=""):
+        """Directory named after scenario suffix, inside the project folder."""
+        project_dir = QgsProject.instance().absolutePath()
+        if not project_dir:
+            raise RuntimeError(
+                "Save the QGIS project before running this step. "
+                "Outputs are written next to the project file."
+            )
+        folder_name = suffix.strip("_ ")
+        if not folder_name:
+            folder_name = "Default_Scenario"
+        scenario_dir = os.path.join(project_dir, folder_name)
+        os.makedirs(scenario_dir, exist_ok=True)
+        return scenario_dir
+
     def _unique_sites_output_path(self, suffix=""):
         """GeoPackage next to the project file for Step 1 unique sites."""
-        return os.path.join(self._project_output_dir(), f"{LAYER_UNIQUE_SITES}{suffix}.gpkg")
+        return os.path.join(self._scenario_output_dir(suffix), f"{LAYER_UNIQUE_SITES}{suffix}.gpkg")
 
     def _remove_output_files(self, *paths):
         """Delete prior Step 2 outputs so GDAL/OGR can recreate them."""
@@ -771,28 +801,28 @@ class TAArcViewshedEngine:
 
     def _master_viewshed_output_dir(self, suffix=""):
         """Folder next to the saved QGIS project file for Step 2 rasters."""
-        output_dir = os.path.join(self._project_output_dir(), f"{GROUP_MASTER_VIEWSHEDS}{suffix}")
+        output_dir = os.path.join(self._scenario_output_dir(suffix), f"{GROUP_MASTER_VIEWSHEDS}{suffix}")
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
 
     def _ta_polygons_output_path(self, suffix=""):
         """GeoPackage for original arc sectors before cascade (Step 3)."""
-        return os.path.join(self._project_output_dir(), f"{LAYER_TA_POLYGONS}{suffix}.gpkg")
+        return os.path.join(self._scenario_output_dir(suffix), f"{LAYER_TA_POLYGONS}{suffix}.gpkg")
 
     def _cascade_polygons_output_path(self, suffix=""):
         """GeoPackage next to the project file for Step 3 cascade pockets."""
-        return os.path.join(self._project_output_dir(), f"{LAYER_CASCADE}{suffix}.gpkg")
+        return os.path.join(self._scenario_output_dir(suffix), f"{LAYER_CASCADE}{suffix}.gpkg")
 
     def _viewshed_with_ta_output_dir(self, suffix=""):
         """Folder next to the project file for Step 4 TA polygon viewsheds."""
-        output_dir = os.path.join(self._project_output_dir(), f"{GROUP_VIEWSHED_WITH_TA}{suffix}")
+        output_dir = os.path.join(self._scenario_output_dir(suffix), f"{GROUP_VIEWSHED_WITH_TA}{suffix}")
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
 
     def _combined_viewshed_output_dir(self, suffix=""):
         """Folder next to the project file for Step 4 combined viewsheds."""
         output_dir = os.path.join(
-            self._project_output_dir(), f"{GROUP_COMBINED_VIEWSHED}{suffix}"
+            self._scenario_output_dir(suffix), f"{GROUP_COMBINED_VIEWSHED}{suffix}"
         )
         os.makedirs(output_dir, exist_ok=True)
         return output_dir
@@ -1274,7 +1304,7 @@ class TAArcViewshedEngine:
             QgsProject.instance().addMapLayer(layer, False)
             group.addLayer(layer)
         else:
-            QgsProject.instance().addMapLayer(layer, True)
+            self._add_layer_at_project_root(layer)
         return layer
 
     def _add_layer_at_project_root(self, layer):
@@ -1292,7 +1322,7 @@ class TAArcViewshedEngine:
             QgsProject.instance().addMapLayer(layer, False)
             group.addLayer(layer)
         else:
-            QgsProject.instance().addMapLayer(layer, True)
+            self._add_layer_at_project_root(layer)
         return layer
 
     def resolve_master_viewshed_paths(self, suffix=""):

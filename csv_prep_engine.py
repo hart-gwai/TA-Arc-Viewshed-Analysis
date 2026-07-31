@@ -51,15 +51,24 @@ PREPARED_LAYER_NAME = "Prepared_Ping_Layer"
 DEFAULT_CRS = QgsCoordinateReferenceSystem("EPSG:4326")
 
 
-def _prepared_ping_output_path(suffix=""):
-    """GeoPackage next to the saved QGIS project file for Prepare Cell Site Data."""
+def _scenario_output_dir(suffix=""):
+    """Folder next to the project file named after the scenario suffix."""
     project_dir = QgsProject.instance().absolutePath()
     if not project_dir:
         raise RuntimeError(
             "Save the QGIS project before running Prepare Cell Site Data. "
-            f"'{PREPARED_LAYER_NAME}{suffix}' is written next to the project file."
+            "Outputs are written next to the project file."
         )
-    return os.path.join(project_dir, f"{PREPARED_LAYER_NAME}{suffix}.gpkg")
+    folder_name = suffix.strip("_ ")
+    if not folder_name:
+        folder_name = "Default_Scenario"
+    scenario_dir = os.path.join(project_dir, folder_name)
+    os.makedirs(scenario_dir, exist_ok=True)
+    return scenario_dir
+
+def _prepared_ping_output_path(suffix=""):
+    """GeoPackage inside the scenario folder for Prepare Cell Site Data."""
+    return os.path.join(_scenario_output_dir(suffix), f"{PREPARED_LAYER_NAME}{suffix}.gpkg")
 
 # Standard field names written to the prepared layer (match logic_engine lookups).
 OUT_TOWER = "Cell_Site"
@@ -898,7 +907,8 @@ class CsvPrepEngine:
         if not saved_layer.isValid():
             raise RuntimeError(f"Failed to load saved prepared ping layer: {output_path}")
 
-        QgsProject.instance().addMapLayer(saved_layer)
+        QgsProject.instance().addMapLayer(saved_layer, False)
+        QgsProject.instance().layerTreeRoot().insertLayer(0, saved_layer)
         self.log(f"Saved prepared ping layer to: {output_path}")
         unique_locations = len(coord_key_to_point)
         unique_sites = len({f[OUT_TOWER] for f in out_features})

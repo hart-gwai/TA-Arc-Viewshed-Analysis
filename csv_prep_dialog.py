@@ -424,7 +424,7 @@ class CsvPrepDialog(QDialog):
 
             aoi_layer = None
             fixed_max_r = None
-            suffix = ""
+            suffix = "_with TA"
 
             if not self.radio_ta_available.isChecked():
                 mapping["min_r"] = NONE_CHOICE
