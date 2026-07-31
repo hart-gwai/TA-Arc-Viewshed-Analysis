@@ -1,8 +1,8 @@
 [general]
-name=TA Arc & Viewshed Analysis
+name=Cell Site Data Analyzer
 qgisMinimumVersion=3.22
 description=Sequential SAR workflow for unique cell sites, master tower viewsheds, cascade arc polygons, and bounded raster multiplication.
-version=1.8.2
+version=1.9.0
 author=SAR Operations
 email=
 

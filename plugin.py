@@ -14,15 +14,15 @@ from .symbology_dialog import ViewshedSymbologyDialog
 
 
 class TAArcViewshedAnalysisPlugin:
-    """QGIS plugin interface for TA Arc & Viewshed Analysis."""
+    """QGIS plugin interface for Cell Site Data Analyzer."""
 
     def __init__(self, iface):
         self.iface = iface
         self.plugin_dir = os.path.dirname(__file__)
         self.actions = []
-        self.menu = "&TA Arc && Viewshed Analysis"
-        self.toolbar = self.iface.addToolBar("TA Arc Viewshed")
-        self.toolbar.setObjectName("TAArcViewshedToolbar")
+        self.menu = "&Cell Site Data Analyzer"
+        self.toolbar = self.iface.addToolBar("Cell Site Analyzer")
+        self.toolbar.setObjectName("CellSiteAnalyzerToolbar")
         self.dialog = None
         self.symbology_dialog = None
 
@@ -59,19 +59,22 @@ class TAArcViewshedAnalysisPlugin:
         return action
 
     def initGui(self):
-        icon_path = os.path.join(self.plugin_dir, "icon.png")
-        icon = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
+        icon_path_main = os.path.join(self.plugin_dir, "icons", "icon_analyzer.svg")
+        icon_path_symb = os.path.join(self.plugin_dir, "icons", "icon_symbology.svg")
+        
+        icon_main = QIcon(icon_path_main) if os.path.exists(icon_path_main) else QIcon()
+        icon_symb = QIcon(icon_path_symb) if os.path.exists(icon_path_symb) else QIcon()
 
         self.add_action(
-            icon,
-            text=self.tr("TA Arc && Viewshed Analysis"),
+            icon_main,
+            text=self.tr("Cell Site Data Analyzer"),
             callback=self.run,
             parent=self.iface.mainWindow(),
-            status_tip=self.tr("Open TA Arc & Viewshed Analysis workflow"),
+            status_tip=self.tr("Open Cell Site Data Analyzer workflow"),
         )
 
         self.add_action(
-            icon,
+            icon_symb,
             text=self.tr("Manage Viewshed Symbology"),
             callback=self.run_symbology,
             add_to_toolbar=False,
