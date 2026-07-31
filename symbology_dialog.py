@@ -47,8 +47,27 @@ class ViewshedSymbologyDialog(QDialog):
 
         form = QFormLayout()
         self.group_combo = QComboBox()
-        for group_name in MANAGED_GROUPS:
+        
+        from qgis.core import QgsProject
+        root = QgsProject.instance().layerTreeRoot()
+        found_groups = []
+        
+        # Dynamically find suffixed viewshed groups in the current project
+        for child in root.children():
+            if child.nodeType() == 0:  # 0 is QgsLayerTree.Group
+                name = child.name()
+                for managed_name in MANAGED_GROUPS:
+                    if name.startswith(managed_name):
+                        found_groups.append(name)
+                        break
+        
+        # Fallback if no matching groups exist yet
+        if not found_groups:
+            found_groups = MANAGED_GROUPS
+            
+        for group_name in found_groups:
             self.group_combo.addItem(group_name, group_name)
+            
         form.addRow("Viewshed group:", self.group_combo)
         layout.addLayout(form)
 

@@ -50,46 +50,19 @@ class TAArcViewshedDialog(QDialog):
         self.setWindowTitle("TA Arc & Viewshed Analysis")
         self.setMinimumWidth(520)
         self._build_ui()
-        self._refresh_data_status()
 
     def showEvent(self, event):
         super().showEvent(event)
-        self._refresh_data_status()
 
     def _prepared_ping_layer(self):
         layers = QgsProject.instance().mapLayersByName(PREPARED_LAYER_NAME)
         return layers[0] if layers else None
-
-    def _refresh_data_status(self):
-        ping_layer = self._prepared_ping_layer()
-        sites_layer = self.engine.find_layer_by_name(LAYER_UNIQUE_SITES)
-
-        if ping_layer is None and sites_layer is None:
-            self.prepared_layer_status.setText(
-                f"Cell site data not prepared — run {STEP_PREPARE} first"
-            )
-            return
-
-        parts = []
-        if ping_layer is not None:
-            parts.append(
-                f"{PREPARED_LAYER_NAME}: {ping_layer.featureCount()} ping feature(s)"
-            )
-        if sites_layer is not None:
-            parts.append(
-                f"{LAYER_UNIQUE_SITES}: {sites_layer.featureCount()} tower(s)"
-            )
-        self.prepared_layer_status.setText(" | ".join(parts))
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
 
         input_group = QGroupBox("Input Setup")
         input_layout = QVBoxLayout(input_group)
-
-        self.prepared_layer_status = QLabel()
-        self.prepared_layer_status.setWordWrap(True)
-        input_layout.addWidget(self.prepared_layer_status)
 
         dem_row = QHBoxLayout()
         dem_row.addWidget(QLabel("DEM Layer:"))
@@ -250,8 +223,7 @@ class TAArcViewshedDialog(QDialog):
             return
             
         dialog = CsvPrepDialog(self.iface, viewshed_engine=self.engine, dem_layer=dem_layer, parent=self)
-        if dialog.exec_() == dialog.Accepted:
-            self._refresh_data_status()
+        dialog.exec_()
 
     @pyqtSlot()
     def _run_step2(self):

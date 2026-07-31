@@ -115,7 +115,7 @@ class CsvPrepDialog(QDialog):
         self.spin_time_bin = QDoubleSpinBox()
         self.spin_time_bin.setDecimals(0)
         self.spin_time_bin.setRange(0, 1440)
-        self.spin_time_bin.setValue(5)
+        self.spin_time_bin.setValue(1)
         self.spin_time_bin.setSuffix(" minutes (0 to disable)")
         time_form.addRow("Time Bin Size:", self.spin_time_bin)
         layout.addWidget(time_group)
