@@ -82,6 +82,14 @@ class TAArcViewshedAnalysisPlugin:
             status_tip=self.tr("Apply viewshed raster symbology to layer groups"),
         )
 
+        # Apply the main icon to the parent menu item created in the Plugins dropdown
+        plugin_menu = self.iface.pluginMenu()
+        if plugin_menu:
+            for action in plugin_menu.actions():
+                if action.text().replace("&", "") == self.menu.replace("&", ""):
+                    action.setIcon(icon_main)
+                    break
+
     def unload(self):
         for action in self.actions:
             self.iface.removePluginMenu(self.menu, action)
