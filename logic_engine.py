@@ -1171,6 +1171,15 @@ class TAArcViewshedEngine:
                     raise RuntimeError(
                         f"Failed to load clipped viewshed: {layer_info['path']}"
                     )
+                    
+                if self.dem_layer is not None:
+                    raster_layer.setCrs(self.dem_layer.crs())
+                if crs is not None:
+                    raster_layer.setCrs(crs)
+                
+                if crs is not None:
+                    raster_layer.setCrs(crs)
+                
                 QgsProject.instance().addMapLayer(raster_layer, False)
                 subgroup.addLayer(raster_layer)
                 created_count += 1
@@ -1313,10 +1322,14 @@ class TAArcViewshedEngine:
         QgsProject.instance().layerTreeRoot().insertLayer(0, layer)
         return layer
 
-    def _add_raster_to_project(self, path, layer_name, group_name=None):
+    def _add_raster_to_project(self, path, layer_name, group_name=None, crs=None):
         layer = QgsRasterLayer(path, layer_name)
         if not layer.isValid():
             raise RuntimeError(f"Failed to load raster: {path}")
+        
+        if crs is not None:
+            layer.setCrs(crs)
+            
         if group_name:
             group = self._ensure_group(group_name)
             QgsProject.instance().addMapLayer(layer, False)
@@ -1823,6 +1836,7 @@ class TAArcViewshedEngine:
                 viewshed_path,
                 f"Viewshed_{tower}",
                 f"{GROUP_MASTER_VIEWSHEDS}{suffix}",
+                crs=dem_layer.crs()
             )
             self.log(
                 f"Master viewshed for {tower}: RADIUS_IN={min_radius}, RADIUS_OBS={max_radius}"
