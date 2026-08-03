@@ -1034,12 +1034,15 @@ class TAArcViewshedEngine:
         minX, maxX, minY, maxY = bbox.xMinimum(), bbox.xMaximum(), bbox.yMinimum(), bbox.yMaximum()
 
         # Write mask geometry to an in-memory GeoJSON file for GDAL Warp cutline
-        # QGIS geom.asJson() returns a Geometry object, not a full FeatureCollection.
+        # Dynamically inject the correct CRS from the DEM layer
+        crs_authid = self.dem_layer.crs().authid() if hasattr(self, 'dem_layer') and self.dem_layer else "EPSG:2326"
+        epsg_code = crs_authid.split(":")[-1] if ":" in crs_authid else "2326"
+        
         geom_json = feat.geometry().asJson()
         geojson_str = json.dumps({
             "type": "FeatureCollection",
             "name": "mask",
-            "crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:EPSG::2326" } },
+            "crs": { "type": "name", "properties": { "name": f"urn:ogc:def:crs:EPSG::{epsg_code}" } },
             "features": [{"type": "Feature", "geometry": json.loads(geom_json), "properties": {"id": 1}}]
         })
         
@@ -1059,6 +1062,8 @@ class TAArcViewshedEngine:
                     outputBounds=[minX, minY, maxX, maxY],
                     cutlineDSName=mask_vsi_path,
                     cropToCutline=True,
+                    srcSRS=crs_authid,
+                    dstSRS=crs_authid,
                     srcNodata=-9999,
                     dstNodata=-9999
                 )
@@ -1171,6 +1176,10 @@ class TAArcViewshedEngine:
                     raise RuntimeError(
                         f"Failed to load clipped viewshed: {layer_info['path']}"
                     )
+                    
+                if hasattr(self, 'dem_layer') and self.dem_layer is not None:
+                    raster_layer.setCrs(self.dem_layer.crs())
+                    
                 QgsProject.instance().addMapLayer(raster_layer, False)
                 subgroup.addLayer(raster_layer)
                 created_count += 1
@@ -1313,10 +1322,14 @@ class TAArcViewshedEngine:
         QgsProject.instance().layerTreeRoot().insertLayer(0, layer)
         return layer
 
-    def _add_raster_to_project(self, path, layer_name, group_name=None):
+    def _add_raster_to_project(self, path, layer_name, group_name=None, crs=None):
         layer = QgsRasterLayer(path, layer_name)
         if not layer.isValid():
             raise RuntimeError(f"Failed to load raster: {path}")
+            
+        if crs is not None:
+            layer.setCrs(crs)
+            
         if group_name:
             group = self._ensure_group(group_name)
             QgsProject.instance().addMapLayer(layer, False)
@@ -1823,6 +1836,7 @@ class TAArcViewshedEngine:
                 viewshed_path,
                 f"Viewshed_{tower}",
                 f"{GROUP_MASTER_VIEWSHEDS}{suffix}",
+                crs=self.dem_layer.crs() if hasattr(self, 'dem_layer') and self.dem_layer else None
             )
             self.log(
                 f"Master viewshed for {tower}: RADIUS_IN={min_radius}, RADIUS_OBS={max_radius}"
