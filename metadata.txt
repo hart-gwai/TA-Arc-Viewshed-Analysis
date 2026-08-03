@@ -1,10 +1,10 @@
 [general]
 name=Cell Site Data Analyser
 qgisMinimumVersion=3.22
-description=Sequential SAR workflow for unique cell sites, master tower viewsheds, cascade arc polygons, and bounded raster multiplication.
-version=2.0.1
-author=SAR Operations
+description=An advanced Cell Site Data Analysis tool designed for locating and tracking mobile phone signals. It renders tower coverage areas and combines intersecting signals into precise viewshed patterns for spatial analysis. Must be used in conjunction with the Visibility Analysis plugin.
+version=2.0.2
+author=hart-gwai
 email=
 
 [about]
-description=Modular TA arc and viewshed analysis plugin for Search and Rescue cell-sector workflows in Hong Kong Grid 1980.
+description=Cell Site Data Analyser is a comprehensive tool for locating and tracking mobile phone signals. It efficiently processes cell site data, renders individual tower coverage areas, and combines intersecting signals into cumulative viewshed patterns to facilitate advanced spatial and Search & Rescue (SAR) analysis. Note: This plugin must be used in conjunction with the Visibility Analysis plugin for QGIS.

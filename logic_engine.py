@@ -1024,49 +1024,65 @@ class TAArcViewshedEngine:
             }
 
         # --- In-Memory NumPy Processing (#1: Eliminates disk I/O bottlenecks) ---
-        from osgeo import gdal
+        from osgeo import gdal, ogr, osr
         import uuid
-        import json
 
         bbox = feat.geometry().boundingBox()
         # Add 1.0 buffer to ensure crop bounding box encompasses cutline
         bbox.grow(max(bbox.width(), bbox.height()) * 0.01 + 1.0)
         minX, maxX, minY, maxY = bbox.xMinimum(), bbox.xMaximum(), bbox.yMinimum(), bbox.yMaximum()
 
-        # Write mask geometry to an in-memory GeoJSON file for GDAL Warp cutline
         # Dynamically inject the correct CRS from the DEM layer
         crs_authid = self.dem_layer.crs().authid() if hasattr(self, 'dem_layer') and self.dem_layer else "EPSG:2326"
-        epsg_code = crs_authid.split(":")[-1] if ":" in crs_authid else "2326"
         
-        geom_json = feat.geometry().asJson()
-        geojson_str = json.dumps({
-            "type": "FeatureCollection",
-            "name": "mask",
-            "crs": { "type": "name", "properties": { "name": f"urn:ogc:def:crs:EPSG::{epsg_code}" } },
-            "features": [{"type": "Feature", "geometry": json.loads(geom_json), "properties": {"id": 1}}]
-        })
+        # Write mask geometry to an in-memory GeoPackage for GDAL Warp cutline
+        mask_vsi_path = f"/vsimem/mask_{uuid.uuid4().hex}.gpkg"
         
-        mask_vsi_path = f"/vsimem/mask_{uuid.uuid4().hex}.geojson"
-        gdal.FileFromMemBuffer(mask_vsi_path, geojson_str.encode('utf-8'))
+        srs = osr.SpatialReference()
+        srs.SetFromUserInput(crs_authid)
+        
+        driver = ogr.GetDriverByName("GPKG")
+        ds_mask = driver.CreateDataSource(mask_vsi_path)
+        layer_mask = ds_mask.CreateLayer("mask", srs, ogr.wkbPolygon)
+        
+        geom = ogr.CreateGeometryFromWkt(feat.geometry().asWkt())
+        feature = ogr.Feature(layer_mask.GetLayerDefn())
+        feature.SetGeometry(geom)
+        layer_mask.CreateFeature(feature)
+        
+        feature = None
+        layer_mask = None
+        ds_mask = None
 
         binary_layers = []
         meta = None
 
         try:
             for path in raster_paths:
+                # Open the source dataset to read its exact NoData value
+                src_ds = gdal.Open(path)
+                if src_ds:
+                    src_band = src_ds.GetRasterBand(1)
+                    actual_nodata = src_band.GetNoDataValue()
+                    src_ds = None
+                else:
+                    actual_nodata = -9999
+                
+                warp_kwargs = {
+                    'format': 'MEM',
+                    'outputBounds': [minX, minY, maxX, maxY],
+                    'cutlineDSName': mask_vsi_path,
+                    'cropToCutline': True,
+                    'srcSRS': crs_authid,
+                    'dstSRS': crs_authid,
+                    'creationOptions': ['COMPRESS=LZW']
+                }
+                if actual_nodata is not None:
+                    warp_kwargs['srcNodata'] = actual_nodata
+                    warp_kwargs['dstNodata'] = actual_nodata
+                    
                 # Need to use standard dict options for Python GDAL bindings
-                ds = gdal.Warp(
-                    '', 
-                    path, 
-                    format='MEM',
-                    outputBounds=[minX, minY, maxX, maxY],
-                    cutlineDSName=mask_vsi_path,
-                    cropToCutline=True,
-                    srcSRS=crs_authid,
-                    dstSRS=crs_authid,
-                    srcNodata=-9999,
-                    dstNodata=-9999
-                )
+                ds = gdal.Warp('', path, **warp_kwargs)
                 
                 if not ds:
                     raise RuntimeError(f"In-memory warp failed for {path} using cutline {mask_vsi_path}")
